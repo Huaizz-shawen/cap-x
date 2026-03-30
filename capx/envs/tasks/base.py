@@ -301,6 +301,26 @@ class CodeExecutionEnvBase(Env):
             return self.low_level_env.render_wrist()
         return None
 
+    def capture_state(self) -> dict[str, Any]:
+        if hasattr(self.low_level_env, "capture_state"):
+            return self.low_level_env.capture_state()
+        raise NotImplementedError(
+            f"{type(self.low_level_env).__name__} does not support capture_state()"
+        )
+
+    def restore_state(self, state: dict[str, Any]) -> None:
+        if hasattr(self.low_level_env, "restore_state"):
+            self.low_level_env.restore_state(state)
+            return
+        raise NotImplementedError(
+            f"{type(self.low_level_env).__name__} does not support restore_state()"
+        )
+
+    def get_reset_state(self) -> dict[str, Any] | None:
+        if hasattr(self.low_level_env, "get_reset_state"):
+            return self.low_level_env.get_reset_state()
+        return None
+
     # Video passthrough for demo compatibility
     def enable_video_capture(
         self,

@@ -1,7 +1,5 @@
-# LIBERO Goal Task 1: put the bowl on the stove
-# Change suite_name and task_id in low_level to run different tasks.
-# Available suites: libero_10, libero_90, libero_object, libero_spatial, libero_goal
-# Use: python capx/envs/launch.py --config-path env_configs/libero/franka_libero_goal_1.yaml --web-ui True
+# LIBERO Object Task 0: pick up the alphabet soup and place it in the basket
+# Use: python capx/envs/launch.py --config-path env_configs/libero/franka_libero_object_0_privileged.yaml
 
 env:
   _target_: capx.envs.tasks.franka.franka_libero_env.FrankaLiberoCodeEnv
@@ -9,14 +7,14 @@ env:
     _target_: capx.envs.tasks.base.CodeExecEnvConfig
     low_level:
       _target_: capx.envs.simulators.libero.FrankaLiberoEnv
-      suite_name: libero_goal
-      task_id: 1
-      privileged: false
+      suite_name: libero_object
+      task_id: 0
+      privileged: true
       max_steps: 8000
       control_freq: 20
-    privileged: false
+    privileged: true
     apis:
-      - FrankaLiberoApi
+      - FrankaLiberoPrivilegedApi
     prompt: |
       You are controlling a Franka Emika robot with API described below.
       Goal: {libero_environment_goal}
@@ -49,17 +47,8 @@ api_servers:
     robot: panda_description
     target_link: panda_hand
 
-  - _target_: capx.serving.launch_contact_graspnet_server.main
-    port: 8115
-    host: 127.0.0.1
-
-  - _target_: capx.serving.launch_sam3_server.main
-    device: cuda
-    port: 8114
-    host: 127.0.0.1
-
 record_video: true
-output_dir: ./outputs/franka_libero_goal_1
+output_dir: ./outputs/franka_libero_object_0_privileged
 
 trials: 50
 num_workers: 10

@@ -109,6 +109,15 @@ class LaunchArgs:
     use_oracle_code: bool | None = None
     """If True, uses pre-defined oracle code instead of querying the model."""
 
+    enable_eap_rollback: bool | None = None
+    """If True, restore the last safe simulator snapshot before executing regenerated code."""
+
+    enable_eap_recovery: bool | None = None
+    """If True, allow one automatic recovery generation after a failed finish on an incomplete task."""
+
+    enable_eap_model_snapshot_selection: bool | None = None
+    """If True, ask the model to choose among candidate rollback snapshots before recovery."""
+
     use_parallel_ensemble: bool | None = None
     """Whether to use parallel ensemble for the coding agent."""
 

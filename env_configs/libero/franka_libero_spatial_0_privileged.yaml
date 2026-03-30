@@ -1,4 +1,4 @@
-# environment config with privileged API
+# LIBERO Spatial Task 0 with privileged API
 # Usage:
 #   uv run capx/envs/launch.py --config-path env_configs/libero/franka_libero_spatial_0_privileged.yaml
 
@@ -10,6 +10,9 @@ env:
       _target_: capx.envs.simulators.libero.FrankaLiberoEnv
       suite_name: libero_spatial
       task_id: 0
+      privileged: true
+      max_steps: 8000
+      control_freq: 20
     privileged: true
     apis:
       - FrankaLiberoPrivilegedApi
@@ -26,15 +29,6 @@ api_servers:
     host: 127.0.0.1
     robot: panda_description
     target_link: panda_hand
-
-  - _target_: capx.serving.launch_contact_graspnet_server.main
-    port: 8115
-    host: 127.0.0.1
-
-  - _target_: capx.serving.launch_sam3_server.main
-    device: cuda
-    port: 8114
-    host: 127.0.0.1
 
 record_video: true
 output_dir: ./outputs/franka_libero_spatial_0_privileged

@@ -50,7 +50,7 @@ class FrankaControlPrivilegedApi(ApiBase):
             "goto_pose": self.goto_pose,
             "open_gripper": self.open_gripper,
             "close_gripper": self.close_gripper,
-            # "home_pose": self.home_pose,
+            "home_pose": self.home_pose,
         }
         # if self.multi_turn:
         #     base_functions["breakpoint_code_block"] = self.breakpoint_code_block

@@ -13,13 +13,20 @@ import pathlib
 import tyro
 from capx.envs.launch import LaunchArgs
 from capx.envs.launch import main as launch_main
+from capx.integrations.libero import STANDARD_LIBERO_SUITES, get_libero_benchmark_dict
 
-# Import Libero to discover tasks
-try:
-    from libero import benchmark
-except ImportError:
-    print("Error: Libero not found. Make sure it is installed and PYTHONPATH is set.")
-    sys.exit(1)
+
+SUITE_PRESETS = {
+    "standard_4": list(STANDARD_LIBERO_SUITES),
+    "pro_table2": [
+        "libero_object_swap",
+        "libero_object_task",
+        "libero_goal_swap",
+        "libero_goal_task",
+        "libero_spatial_swap",
+        "libero_spatial_task",
+    ],
+}
 
 
 @dataclass
@@ -30,17 +37,9 @@ class LiberoBatchLaunchArgs:
     base_config_path: str = "env_configs/libero/franka_libero.yaml"
 
     # Suites to run
-    suites: list[str] = field(
-        default_factory=lambda: [
-            # Table 2 suites: Pos (swap) and Task perturbations
-            "libero_object_swap",
-            "libero_object_task",
-            "libero_goal_swap",
-            "libero_goal_task",
-            "libero_spatial_swap",
-            "libero_spatial_task",
-        ]
-    )
+    suite_preset: str = "standard_4"
+
+    suites: list[str] = field(default_factory=list)
 
     # Models to run (copied from run_batch.py default)
     models: list[str] = field(
@@ -71,7 +70,20 @@ class LiberoBatchLaunchArgs:
 
 
 def main(args: LiberoBatchLaunchArgs) -> None:
-    benchmark_dict = benchmark.get_benchmark_dict()
+    try:
+        benchmark_dict = get_libero_benchmark_dict()
+    except ModuleNotFoundError:
+        print("Error: Libero not found. Make sure it is installed and PYTHONPATH is set.")
+        sys.exit(1)
+
+    suites = args.suites or SUITE_PRESETS.get(args.suite_preset)
+    if not suites:
+        presets = ", ".join(sorted(SUITE_PRESETS))
+        print(
+            f"Error: unknown suite preset {args.suite_preset!r}. "
+            f"Provide --suites explicitly or use one of: {presets}"
+        )
+        sys.exit(1)
     
     # Load base configuration
     if not os.path.exists(args.base_config_path):
@@ -83,9 +95,9 @@ def main(args: LiberoBatchLaunchArgs) -> None:
     
     tasks_to_run = []
     
-    print(f"Collecting tasks for suites: {args.suites}")
+    print(f"Collecting tasks for suites: {suites}")
     
-    for suite_name in args.suites:
+    for suite_name in suites:
         if suite_name not in benchmark_dict:
             print(f"Warning: Suite '{suite_name}' not found in Libero benchmarks.")
             continue

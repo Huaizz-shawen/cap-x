@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import os
-import sys
+import copy
 from typing import Any, Literal
 
 import numpy as np
@@ -16,20 +15,6 @@ from capx.envs.base import BaseEnv
 from capx.integrations.libero import load_libero_task
 from capx.utils.camera_utils import obs_get_rgb
 from capx.utils.depth_utils import depth_color_to_pointcloud
-
-here = os.path.dirname(os.path.abspath(__file__))
-vendor_root = os.path.normpath(os.path.join(here, "..", "third_party", "LIBERO"))
-if os.path.isdir(vendor_root) and vendor_root not in sys.path:
-    sys.path.append(vendor_root)
-# try:
-from libero import benchmark  # type: ignore[import-not-found]
-from libero.envs import OffScreenRenderEnv  # type: ignore[import-not-found]
-from libero.utils import get_libero_path  # type: ignore[import-not-found]
-# except Exception as e:  # pragma: no cover - optional dependency
-#     raise ModuleNotFoundError(
-#         "LIBERO not available; add submodule or run `uv sync --extra libero`."
-#     ) from e
-
 
 class FrankaLiberoEnv(BaseEnv):
     """Franka Libero environment.
@@ -84,6 +69,7 @@ class FrankaLiberoEnv(BaseEnv):
         self._record_wrist_camera = False
         self._wrist_camera_name = "robot0_eye_in_hand"
         self._subsample_rate = 4
+        self._reset_state: dict[str, Any] | None = None
 
         # Robot link indices for transforms
         self.gripper_metric_length = 0.04
@@ -187,6 +173,7 @@ class FrankaLiberoEnv(BaseEnv):
                 self.handle.env.sim.data.xpos[self.gripper_link_idx],
             ]
         )
+        self._reset_state = self._build_state_snapshot()
 
         info = {"task_prompt": self.handle.task_language}
         return obs, info
@@ -420,6 +407,80 @@ class FrankaLiberoEnv(BaseEnv):
 
     def compute_reward(self) -> float:
         return self._current_reward
+
+    def _copy_state_value(self, value: Any) -> Any:
+        if isinstance(value, np.ndarray):
+            return value.copy()
+        if isinstance(value, dict):
+            return {k: self._copy_state_value(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [self._copy_state_value(v) for v in value]
+        if isinstance(value, tuple):
+            return tuple(self._copy_state_value(v) for v in value)
+        return copy.deepcopy(value)
+
+    def _build_state_snapshot(self) -> dict[str, Any]:
+        sim_state = self.handle.env.sim.get_state().flatten().copy()
+        return {
+            "sim_state": sim_state,
+            "current_obs": self._copy_state_value(self._current_obs),
+            "current_info": self._copy_state_value(self._current_info),
+            "current_reward": self._current_reward,
+            "current_done": self._current_done,
+            "current_joints": None if self._current_joints is None else self._current_joints.copy(),
+            "gripper_fraction": float(self._gripper_fraction),
+            "step_count": int(self._step_count),
+            "sim_step_count": int(self._sim_step_count),
+            "home_joint_position": None
+            if self.home_joint_position is None
+            else self.home_joint_position.copy(),
+        }
+
+    def capture_state(self) -> dict[str, Any]:
+        """Capture a deterministic LIBERO simulator snapshot."""
+        return self._build_state_snapshot()
+
+    def restore_state(self, state: dict[str, Any]) -> None:
+        """Restore a previously captured LIBERO simulator snapshot."""
+        sim_state = np.asarray(state["sim_state"], dtype=np.float64)
+        self._current_obs = self.handle.env.regenerate_obs_from_state(sim_state)
+
+        # Refresh cached task state from the underlying simulator after rewind.
+        self._current_reward = float(self.handle.env.env.reward(None))
+        self._current_done = bool(self.handle.env.check_success())
+        self._current_info = self._copy_state_value(state.get("current_info", {}))
+        self._current_joints = np.array(
+            self.handle.env.sim.data.qpos[self._panda_joint_qpos_addrs], dtype=np.float64
+        )
+
+        gripper_qpos = 0.0
+        if self._current_obs is not None:
+            gripper_qpos = float(self._current_obs["robot0_gripper_qpos"][0])
+        self._gripper_fraction = float(np.clip(gripper_qpos / self.gripper_metric_length, 0.0, 1.0))
+
+        self._step_count = int(state.get("step_count", 0))
+        self._sim_step_count = int(state.get("sim_step_count", 0))
+
+        if state.get("home_joint_position") is not None:
+            self.home_joint_position = np.asarray(state["home_joint_position"], dtype=np.float64).copy()
+
+        self.base_link_wxyz_xyz = np.concatenate(
+            [
+                self.handle.env.sim.data.xquat[self.base_link_idx],
+                self.handle.env.sim.data.xpos[self.base_link_idx],
+            ]
+        )
+        self.gripper_link_wxyz_xyz = np.concatenate(
+            [
+                self.handle.env.sim.data.xquat[self.gripper_link_idx],
+                self.handle.env.sim.data.xpos[self.gripper_link_idx],
+            ]
+        )
+
+    def get_reset_state(self) -> dict[str, Any] | None:
+        if self._reset_state is None:
+            return None
+        return self._copy_state_value(self._reset_state)
 
     def get_observation(self) -> dict[str, Any]:
         """Get observation in FrankaLiberoEnv format."""
@@ -732,7 +793,7 @@ class FrankaLiberoEnv(BaseEnv):
 class FrankaLiberoTask(FrankaLiberoEnv):
     """Generic LIBERO task — specify any suite and task index.
 
-    Use this class in YAML configs to run any LIBERO-PRO task without
+    Use this class in YAML configs to run any LIBERO or LIBERO-PRO task without
     writing a new Python class::
 
         env:

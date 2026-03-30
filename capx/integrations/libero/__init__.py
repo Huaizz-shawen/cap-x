@@ -1,11 +1,104 @@
 from __future__ import annotations
 
+import importlib
 import os
 import re
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
+
+STANDARD_LIBERO_SUITES = (
+    "libero_10",
+    "libero_object",
+    "libero_spatial",
+    "libero_goal",
+)
+
+
+def _maybe_add_vendor_roots() -> None:
+    here = Path(__file__).resolve()
+    vendor_roots = (
+        here.parents[2] / "third_party" / "LIBERO-PRO",
+        here.parents[2] / "third_party" / "LIBERO-PRO" / "libero",
+    )
+    for vendor_root in vendor_roots:
+        vendor_root_str = str(vendor_root)
+        if vendor_root.is_dir() and vendor_root_str not in sys.path:
+            sys.path.append(vendor_root_str)
+
+
+def _import_first(module_names: tuple[str, ...]) -> Any:
+    last_error: Exception | None = None
+    for module_name in module_names:
+        try:
+            return importlib.import_module(module_name)
+        except Exception as exc:  # pragma: no cover - exercised via fallback order
+            last_error = exc
+    raise ModuleNotFoundError(
+        f"Could not import any of the expected LIBERO modules: {module_names}"
+    ) from last_error
+
+
+def _import_libero_modules() -> tuple[Any, Any, Any]:
+    _maybe_add_vendor_roots()
+    benchmark_module = _import_first(("libero.benchmark", "libero.libero.benchmark"))
+    envs_module = _import_first(("libero.envs", "libero.libero.envs"))
+    path_module_names = ("libero.utils", "libero", "libero.libero.utils", "libero.libero")
+    get_libero_path = None
+    last_path_module = None
+    for module_name in path_module_names:
+        try:
+            path_module = importlib.import_module(module_name)
+        except Exception:
+            continue
+        last_path_module = path_module
+        get_libero_path = getattr(path_module, "get_libero_path", None)
+        if get_libero_path is not None:
+            break
+    if get_libero_path is None:
+        module_name = "<unimportable>" if last_path_module is None else last_path_module.__name__
+        raise AttributeError(f"Module {module_name} does not export get_libero_path")
+    return benchmark_module, envs_module.OffScreenRenderEnv, get_libero_path
+
+
+def get_libero_benchmark_dict(*, help: bool = False) -> dict[str, Any]:
+    benchmark_module, _, _ = _import_libero_modules()
+    return benchmark_module.get_benchmark_dict(help=help)
+
+
+def _resolve_libero_asset_path(
+    asset_key: str, problem_folder: str, filename: str, get_libero_path: Any
+) -> str:
+    asset_dir_by_key = {
+        "bddl_files": "bddl_files",
+        "init_states": "init_files",
+    }
+    if asset_key not in asset_dir_by_key:
+        raise KeyError(f"Unsupported LIBERO asset key: {asset_key}")
+
+    candidates: list[Path] = []
+    try:
+        root_path = Path(get_libero_path(asset_key))
+        candidates.append(root_path / problem_folder / filename)
+    except Exception:
+        pass
+
+    here = Path(__file__).resolve()
+    vendor_root = here.parents[2] / "third_party" / "LIBERO-PRO" / "libero" / "libero"
+    candidates.append(vendor_root / asset_dir_by_key[asset_key] / problem_folder / filename)
+
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+
+    searched = ", ".join(str(candidate) for candidate in candidates)
+    raise FileNotFoundError(
+        f"Could not locate LIBERO asset {filename!r} for suite folder {problem_folder!r}. "
+        f"Searched: {searched}"
+    )
 
 
 @dataclass
@@ -54,48 +147,27 @@ def load_libero_task(
 
     Reference: https://github.com/Lifelong-Robot-Learning/LIBERO
     """
-    # Prefer vendored third_party/LIBERO if present, then fall back to installed package
-    import os
-    import sys
-
-    here = os.path.dirname(os.path.abspath(__file__))
-    vendor_root = os.path.normpath(os.path.join(here, "..", "..", "third_party", "LIBERO-PRO"))
-    if os.path.isdir(vendor_root) and vendor_root not in sys.path:
-        sys.path.append(vendor_root)
     try:
-        from libero import benchmark  # type: ignore[import-not-found]
-        from libero.envs import OffScreenRenderEnv  # type: ignore[import-not-found]
-        from libero.utils import get_libero_path  # type: ignore[import-not-found]
+        benchmark, OffScreenRenderEnv, get_libero_path = _import_libero_modules()
     except Exception as e:  # pragma: no cover - optional dependency
         raise ModuleNotFoundError(
             "LIBERO not available; add submodule or run `uv sync --extra libero`."
         ) from e
-    import os
 
     # setting help=True will print the available benchmarks
     benchmark_dict = benchmark.get_benchmark_dict(help=False)
+    if suite_name not in benchmark_dict:
+        available = ", ".join(sorted(benchmark_dict.keys()))
+        raise KeyError(f"Unknown LIBERO suite {suite_name!r}. Available suites: {available}")
     task_suite = benchmark_dict[suite_name]()
     task = task_suite.get_task(task_id)
 
-    bddl_file_path = os.path.join(
-        get_libero_path("bddl_files"), task.problem_folder, task.bddl_file
+    bddl_file_path = _resolve_libero_asset_path(
+        "bddl_files",
+        task.problem_folder,
+        task.bddl_file,
+        get_libero_path,
     )
-
-    if not os.path.exists(bddl_file_path):
-        # Fallback: try to locate BDDL files relative to this file
-        # This handles cases where get_libero_path returns incorrect relative paths
-        here = os.path.dirname(os.path.abspath(__file__))
-        # Path: capx/integrations/libero/../../third_party/LIBERO-PRO/libero/libero/bddl_files
-        fallback_bddl_root = os.path.abspath(
-            os.path.join(here, "..", "..", "third_party", "LIBERO-PRO", "libero", "libero", "bddl_files")
-        )
-        fallback_path = os.path.join(fallback_bddl_root, task.problem_folder, task.bddl_file)
-
-        if os.path.exists(fallback_path):
-            print(f"Found BDDL file at fallback path: {fallback_path}")
-            bddl_file_path = fallback_path
-        else:
-            print(f"Error: BDDL file not found at {bddl_file_path} OR {fallback_path}")
 
     env_args = {
         "bddl_file_name": bddl_file_path,
@@ -120,31 +192,17 @@ def load_libero_task(
     try:
         init_states = task_suite.get_task_init_states(task_id)
         print(f"Loaded init states for task {task_id} in suite {suite_name}")
-    except (FileNotFoundError, OSError):
+    except Exception:
         print(f"Warning: Could not load init states for task {task_id} in suite {suite_name}")
-        # Fallback for init states
-        init_states_path = os.path.join(
-            get_libero_path("init_states"), task.problem_folder, task.init_states_file
+        init_states_path = _resolve_libero_asset_path(
+            "init_states",
+            task.problem_folder,
+            task.init_states_file,
+            get_libero_path,
         )
+        import torch
 
-        if not os.path.exists(init_states_path):
-             here = os.path.dirname(os.path.abspath(__file__))
-             fallback_init_root = os.path.abspath(
-                os.path.join(here, "..", "third_party", "LIBERO-PRO", "libero", "libero", "init_files")
-             )
-             fallback_init_path = os.path.join(fallback_init_root, task.problem_folder, task.init_states_file)
-
-             if os.path.exists(fallback_init_path):
-                 print(f"Found init states file at fallback path: {fallback_init_path}")
-                 import torch
-                 init_states = torch.load(fallback_init_path)
-             else:
-                 print(f"Error: Init states file not found at {init_states_path} OR {fallback_init_path}")
-                 raise
-        else:
-             # If path exists but load failed for other reasons, try loading directly with explicit path
-             import torch
-             init_states = torch.load(init_states_path)
+        init_states = torch.load(init_states_path)
 
     handle = LiberoHandle(
         env=env,

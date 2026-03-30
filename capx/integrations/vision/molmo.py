@@ -164,6 +164,9 @@ def init_molmo(
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
+    is_local_default_service = base_url.rstrip("/") == SERVICE_URL
+    service_available = True
+    service_unavailable_logged = False
 
     def det_fn(
         image: PIL.Image.Image, objects: list[str] | None = None
@@ -180,6 +183,9 @@ def init_molmo(
 
         if not objects:
             return {}
+        nonlocal service_available, service_unavailable_logged
+        if not service_available:
+            return {obj: (None, None) for obj in objects}
 
         img_url = _image_to_data_url(image)
         all_points: dict[str, tuple[int | None, int | None]] = {}
@@ -203,7 +209,7 @@ def init_molmo(
                 "stop": ["<|endoftext|>"],
             }
 
-            max_retries, backoff = 3, 1.0
+            max_retries, backoff = (1, 1.0) if is_local_default_service else (3, 1.0)
             for attempt in range(max_retries):
                 try:
                     resp = session.post(chat_url, json=payload, headers=headers, timeout=120)
@@ -214,6 +220,16 @@ def init_molmo(
                     break
                 except Exception as e:  # noqa: BLE001
                     print(f"Request failed for '{obj}' (attempt {attempt + 1}/{max_retries}): {e}")
+                    if is_local_default_service:
+                        service_available = False
+                        if not service_unavailable_logged:
+                            print(
+                                "Molmo service is unavailable on 127.0.0.1:8122; "
+                                "future point-prompt requests will be skipped."
+                            )
+                            service_unavailable_logged = True
+                        generated_text = ""
+                        break
                     if attempt < max_retries - 1:
                         time.sleep(backoff * (2 ** attempt))
                     else:

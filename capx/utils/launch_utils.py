@@ -22,6 +22,7 @@ from PIL import Image
 
 from capx.envs.configs.instantiate import instantiate
 from capx.envs.configs.loader import DictLoader
+from capx.envs.trajectory_buffer import save_trajectory_artifacts
 
 # Re-export LLM client symbols for backward compatibility
 from capx.llm.client import (  # noqa: F401
@@ -131,6 +132,15 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
         "use_oracle_code": args.use_oracle_code
         if args.use_oracle_code is not None
         else configs_dict.get("use_oracle_code", False),
+        "enable_eap_rollback": args.enable_eap_rollback
+        if getattr(args, "enable_eap_rollback", None) is not None
+        else configs_dict.get("enable_eap_rollback", False),
+        "enable_eap_recovery": args.enable_eap_recovery
+        if getattr(args, "enable_eap_recovery", None) is not None
+        else configs_dict.get("enable_eap_recovery", False),
+        "enable_eap_model_snapshot_selection": args.enable_eap_model_snapshot_selection
+        if getattr(args, "enable_eap_model_snapshot_selection", None) is not None
+        else configs_dict.get("enable_eap_model_snapshot_selection", False),
         "resume_idx": configs_dict.get("resume_idx", None),
         "use_visual_feedback": args.use_visual_feedback
         if args.use_visual_feedback is not None
@@ -386,6 +396,7 @@ def _save_trial_artifacts(
     visual_feedback_imgs: list[Image.Image],
     ensemble_data: dict[str, str] | None = None,
     multiturn_ensemble_data: list[dict[str, str]] | None = None,
+    trajectory_data: dict[str, Any] | None = None,
 ) -> str | None:
     """Save trial artifacts (code, logs, images) to the output directory.
 
@@ -456,6 +467,9 @@ def _save_trial_artifacts(
             i += 1
     for i, img in enumerate(visual_feedback_imgs):
         img.save(trial_dir / f"visual_feedback_{i:02d}.png")
+
+    if trajectory_data is not None:
+        save_trajectory_artifacts(trial_dir, trajectory_data)
 
     return code_path
 

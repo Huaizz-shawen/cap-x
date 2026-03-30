@@ -24,6 +24,7 @@ from capx.envs.trial import (
     _build_log_lines,
     _run_single_trial,
 )
+from capx.envs.trajectory_buffer import append_event
 from capx.utils.launch_utils import (
     TrialSummary,
     _print_and_save_summary,
@@ -348,6 +349,23 @@ def _build_timeout_summary(
         prefix=f"Trial {trial} timed out after {timeout_seconds} seconds.",
     )
 
+    trajectory_data = pa.get("trajectory_data")
+    if trajectory_data is not None:
+        append_event(
+            trajectory_data,
+            "trial_timeout",
+            timeout_seconds=timeout_seconds,
+            reward=reward,
+            terminated=terminated,
+            truncated=truncated,
+            sandbox_rc=1,
+            task_completed=info_step.get("task_completed", False),
+            error=str(exc),
+            num_regenerations=num_regenerations,
+            num_finishes=num_finishes,
+            num_code_blocks=num_code_blocks,
+        )
+
     code_path = _save_trial_artifacts(
         config, trial,
         sandbox_rc=1,
@@ -360,6 +378,7 @@ def _build_timeout_summary(
         visual_feedback_imgs=pa.get("visual_feedback_imgs", []),
         ensemble_data=pa.get("ensemble_data"),
         multiturn_ensemble_data=pa.get("multiturn_ensemble_data", []),
+        trajectory_data=trajectory_data,
     )
 
     return TrialSummary(

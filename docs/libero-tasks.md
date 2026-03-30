@@ -1,6 +1,6 @@
-# LIBERO-PRO Tasks
+# LIBERO Tasks
 
-CaP-X supports LIBERO-PRO tasks by adding additional environment configs. 
+CaP-X supports both the standard LIBERO suites and the extended LIBERO-PRO perturbation suites.
 
 ## Setup
 
@@ -40,6 +40,62 @@ python capx/envs/launch.py \
     --config-path env_configs/libero/franka_libero_spatial_0.yaml \
     --total-trials 10
 ```
+
+## Running the Batch Evaluator
+
+The batch runner can now target either the standard four LIBERO suites or the LIBERO-PRO perturbation suites from the same entrypoint.
+
+```bash
+source .venv-libero/bin/activate
+python capx/envs/scripts/run_libero_batch.py --suite-preset standard_4
+python capx/envs/scripts/run_libero_batch.py --suite-preset pro_table2
+```
+
+You can also override the preset completely:
+
+```bash
+python capx/envs/scripts/run_libero_batch.py --suites libero_object libero_goal
+```
+
+## Reproducing the Standard Experiments
+
+To reproduce the LIBERO experiments used during repository validation, use the fixed script below. It runs:
+
+- `privileged` `libero_spatial` with the primary model
+- `privileged` `libero_goal` with the primary model
+- `privileged` `libero_spatial` with the comparison model
+- `privileged` `libero_goal` with the comparison model
+- `non-privileged` `libero_spatial` with the primary model
+- `non-privileged` `libero_goal` with the primary model
+
+```bash
+source .venv-libero/bin/activate
+bash scripts/reproduce_libero_standard_experiments.sh \
+  --server-url http://10.11.18.197:8317/v1/chat/completions \
+  --api-key YOUR_KEY
+```
+
+Defaults match the experiments we already ran:
+
+- primary model: `gpt-5.3-codex`
+- comparison model: `gpt-5.4`
+- privileged trials: `5`
+- non-privileged trials: `3`
+
+You can override them:
+
+```bash
+bash scripts/reproduce_libero_standard_experiments.sh \
+  --server-url http://10.11.18.197:8317/v1/chat/completions \
+  --api-key YOUR_KEY \
+  --primary-model gpt-5.3-codex \
+  --compare-model gpt-5.4 \
+  --privileged-trials 5 \
+  --non-privileged-trials 3 \
+  --output-root ./outputs/libero_repro
+```
+
+The script writes one log per run to `outputs/libero_repro/logs/` and a tabular summary to `outputs/libero_repro/summary.tsv`.
 
 ## Choosing a Task
 
@@ -133,6 +189,17 @@ Copy an existing config and change `suite_name` and `task_id`:
 cp env_configs/libero/franka_libero_spatial_0.yaml env_configs/libero/franka_libero_goal_5.yaml
 ```
 
+Example configs for the standard suites:
+
+- `env_configs/libero/franka_libero.yaml` for `libero_10` non-privileged
+- `env_configs/libero/franka_libero_10_0_privileged.yaml` for `libero_10` privileged
+- `env_configs/libero/franka_libero_object_0.yaml` for `libero_object` non-privileged
+- `env_configs/libero/franka_libero_object_0_privileged.yaml` for `libero_object` privileged
+- `env_configs/libero/franka_libero_spatial_0.yaml` for `libero_spatial` non-privileged
+- `env_configs/libero/franka_libero_spatial_0_privileged.yaml` for `libero_spatial` privileged
+- `env_configs/libero/franka_libero_goal_1.yaml` for `libero_goal` non-privileged
+- `env_configs/libero/franka_libero_goal_1_privileged.yaml` for `libero_goal` privileged
+
 Then edit `suite_name` and `task_id` in the new file:
 
 ```yaml
@@ -143,6 +210,8 @@ low_level:
 ```
 
 The task prompt is automatically populated from LIBERO's task language description via the `{libero_environment_goal}` placeholder.
+
+Privileged configs only need `PyRoKi`. Non-privileged configs also start `SAM3` and `GraspNet`.
 
 ## Config Reference
 

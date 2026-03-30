@@ -74,6 +74,23 @@ class BaseEnv(Env):
         """
         raise NotImplementedError
 
+    def capture_state(self) -> dict[str, Any]:
+        """Capture a restorable simulator snapshot.
+
+        Low-level environments that support deterministic rewind should override
+        this. The default implementation makes the capability explicit at runtime
+        without forcing every environment subclass to implement it immediately.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support capture_state()")
+
+    def restore_state(self, state: dict[str, Any]) -> None:
+        """Restore a previously captured simulator snapshot."""
+        raise NotImplementedError(f"{type(self).__name__} does not support restore_state()")
+
+    def get_reset_state(self) -> dict[str, Any] | None:
+        """Return the canonical post-reset state, if the environment tracks one."""
+        return None
+
 
 # Use user's BaseEnv for low-level envs
 

@@ -18,6 +18,7 @@ import gc
 import io
 import json
 import os
+import re
 import time
 from typing import Any
 
@@ -25,7 +26,13 @@ import numpy as np
 from PIL import Image
 
 from capx.envs.configs.instantiate import instantiate
+from capx.envs.phase_candidates import infer_phase_candidates, phase_tags_from_candidates
 from capx.envs.tasks.base import CodeExecutionEnvBase
+from capx.envs.trajectory_buffer import (
+    append_event,
+    append_snapshot,
+    create_trajectory_buffer,
+)
 
 from capx.llm.client import (
     VLM_MODELS,
@@ -498,6 +505,189 @@ def _query_initial_code(
     return out["content"], out["reasoning"], ensemble_data
 
 
+def _build_recovery_prompt(
+    obs: dict[str, Any],
+    *,
+    executed_code: str,
+    console_stdout: str,
+    console_stderr: str,
+    recovery_reason: str,
+) -> list[dict[str, Any]]:
+    prompt = copy.deepcopy(obs["full_prompt"])
+    prompt[-1]["content"].append(
+        {
+            "type": "text",
+            "text": (
+                "The previous attempt did not successfully complete the task. "
+                "The environment has already been restored to a safe earlier "
+                "snapshot before the failed action. Generate exactly one new "
+                "Python code block that recovers from the current state and "
+                "continues the task.\n\n"
+                f"Recovery reason: {recovery_reason}\n\n"
+                "Previously executed code:\n"
+                f"```python\n{executed_code}\n```\n"
+                f"Console stdout:\n```\n{console_stdout}\n```\n"
+                f"Console stderr:\n```\n{console_stderr}\n```\n"
+                "Respond with only executable Python code in a fenced "
+                "```python``` block. Do not write REGENERATE or FINISH."
+            ),
+        }
+    )
+    return prompt
+
+
+def _query_recovery_code(
+    args: LaunchArgs,
+    obs: dict[str, Any],
+    *,
+    executed_code: str,
+    console_stdout: str,
+    console_stderr: str,
+    recovery_reason: str,
+) -> tuple[str, str | None, list[dict[str, Any]]]:
+    recovery_prompt = _build_recovery_prompt(
+        obs,
+        executed_code=executed_code,
+        console_stdout=console_stdout,
+        console_stderr=console_stderr,
+        recovery_reason=recovery_reason,
+    )
+    out = _query_model(args, recovery_prompt)
+    return out["content"], out["reasoning"], recovery_prompt
+
+
+def _extract_latest_prompt_text(obs: dict[str, Any]) -> str:
+    for message in reversed(obs.get("full_prompt", [])):
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+        if isinstance(content, list):
+            texts = [
+                item.get("text", "").strip()
+                for item in content
+                if isinstance(item, dict) and item.get("type") == "text" and item.get("text")
+            ]
+            joined = "\n".join(text for text in texts if text)
+            if joined:
+                return joined
+    return ""
+
+
+def _build_snapshot_selection_prompt(
+    obs: dict[str, Any],
+    *,
+    purpose: str,
+    candidates: list[dict[str, Any]],
+    preferred_phases: list[str],
+    executed_code: str,
+    console_stdout: str,
+    console_stderr: str,
+) -> list[dict[str, Any]]:
+    candidate_lines = []
+    for candidate in candidates:
+        phase_tags = ", ".join(candidate.get("phase_tags", [])) or "none"
+        summary = candidate.get("summary", {})
+        candidate_lines.append(
+            (
+                f"- {candidate['snapshot_id']}: type={candidate['snapshot_type']}, "
+                f"code_block_idx={candidate['code_block_idx']}, "
+                f"open_gripper={candidate['is_open_gripper']}, "
+                f"phase_tags={phase_tags}, "
+                f"reward={summary.get('reward')}, done={summary.get('done')}"
+            )
+        )
+
+    task_text = _extract_latest_prompt_text(obs)
+    prompt_text = (
+        "Select a single simulator snapshot to recover from.\n\n"
+        f"Task context:\n{task_text}\n\n"
+        f"Selection purpose: {purpose}\n"
+        "You must choose exactly one snapshot_id from the provided candidates. "
+        "Prefer uncontaminated earlier states that are safe to resume from. "
+        "Open-gripper snapshots and phases aligned with the preferred phase list "
+        "are usually safer.\n\n"
+        f"Preferred phases: {', '.join(preferred_phases)}\n\n"
+        "Executed code up to the failure point:\n"
+        f"```python\n{executed_code}\n```\n"
+        f"Console stdout:\n```\n{console_stdout}\n```\n"
+        f"Console stderr:\n```\n{console_stderr}\n```\n"
+        "Candidate snapshots:\n"
+        f"{os.linesep.join(candidate_lines)}\n\n"
+        'Respond with JSON only, for example: {"snapshot_id": "snap_0001", "reason": "..."}. '
+        "Do not invent snapshot ids outside the candidate list."
+    )
+    return [
+        {
+            "role": "system",
+            "content": "You are a recovery-point selector for a robot simulator.",
+        },
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": prompt_text}],
+        },
+    ]
+
+
+def _parse_snapshot_selection_response(
+    content: str,
+    *,
+    valid_snapshot_ids: set[str],
+) -> tuple[str | None, str | None]:
+    stripped = content.strip()
+    parsed_reason = None
+
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        parsed = None
+
+    if isinstance(parsed, dict):
+        snapshot_id = parsed.get("snapshot_id")
+        if isinstance(snapshot_id, str) and snapshot_id in valid_snapshot_ids:
+            reason = parsed.get("reason")
+            parsed_reason = reason if isinstance(reason, str) else None
+            return snapshot_id, parsed_reason
+
+    if stripped in valid_snapshot_ids:
+        return stripped, parsed_reason
+
+    match = re.search(r"\bsnap_\d+\b", stripped)
+    if match is not None:
+        snapshot_id = match.group(0)
+        if snapshot_id in valid_snapshot_ids:
+            return snapshot_id, parsed_reason
+
+    return None, parsed_reason
+
+
+def _query_snapshot_selection(
+    args: LaunchArgs,
+    obs: dict[str, Any],
+    *,
+    purpose: str,
+    candidates: list[dict[str, Any]],
+    preferred_phases: list[str],
+    executed_code: str,
+    console_stdout: str,
+    console_stderr: str,
+) -> tuple[str | None, str | None, str | None, list[dict[str, Any]], str | None]:
+    selection_prompt = _build_snapshot_selection_prompt(
+        obs,
+        purpose=purpose,
+        candidates=candidates,
+        preferred_phases=preferred_phases,
+        executed_code=executed_code,
+        console_stdout=console_stdout,
+        console_stderr=console_stderr,
+    )
+    out = _query_model(args, selection_prompt)
+    selected_snapshot_id, parsed_reason = _parse_snapshot_selection_response(
+        out["content"],
+        valid_snapshot_ids={candidate["snapshot_id"] for candidate in candidates},
+    )
+    return selected_snapshot_id, out["content"], out["reasoning"], selection_prompt, parsed_reason
+
+
 # ---------------------------------------------------------------------------
 # Multi-turn decision handling
 # ---------------------------------------------------------------------------
@@ -647,6 +837,9 @@ def _run_single_trial(
 
     use_video_diff = config.get("use_video_differencing", False)
     use_wrist = config.get("use_wrist_camera", False)
+    enable_eap_rollback = config.get("enable_eap_rollback", False)
+    enable_eap_recovery = config.get("enable_eap_recovery", False)
+    enable_eap_model_snapshot_selection = config.get("enable_eap_model_snapshot_selection", False)
 
     # --- 1. Reset environment ---
     obs, _ = env.reset(options={"trial": trial}, seed=trial)
@@ -672,6 +865,7 @@ def _run_single_trial(
     stderr_history: list[str] = []
     num_regenerations = 0
     num_finishes = 0
+    num_recoveries = 0
     info_step: dict[str, Any] = {"sandbox_rc": -1, "stdout": "", "stderr": ""}
     reward = 0.0
     terminated = truncated = False
@@ -703,6 +897,27 @@ def _run_single_trial(
     # --- 2. Capture initial visual feedback ---
     visual_feedback_imgs, visual_feedback_base64_history, task_description = (
         _capture_initial_visual_feedback(env, obs, config, args, visual_differencing_args)
+    )
+
+    trajectory_data = create_trajectory_buffer(
+        trial=trial,
+        config_path=args.config_path,
+        task_prompt=obs["full_prompt"][-1]["content"][0]["text"],
+    )
+    reset_state = env.get_reset_state() if hasattr(env, "get_reset_state") else None
+    reset_snapshot_id = append_snapshot(
+        trajectory_data,
+        state=reset_state,
+        env=env if reset_state is None else None,
+        snapshot_type="reset",
+        label="canonical_reset_state",
+        phase_tags=["reset", "home"],
+    )
+    append_event(
+        trajectory_data,
+        "reset_complete",
+        snapshot_id=reset_snapshot_id,
+        task_description=task_description,
     )
 
     # Seed wrist base64 history with initial wrist image
@@ -744,6 +959,7 @@ def _run_single_trial(
             "num_code_blocks": 0,
             "ensemble_data": ensemble_data,
             "multiturn_ensemble_data": multiturn_ensemble_data,
+            "trajectory_data": trajectory_data,
         })
 
     # Parse initial code into blocks
@@ -757,6 +973,14 @@ def _run_single_trial(
         "initial_prompt": copy.deepcopy(obs["full_prompt"]),
         "reasoning": reasoning if reasoning is not None else "",
     })
+    append_event(
+        trajectory_data,
+        "initial_generation",
+        block_idx=[0],
+        code_blocks=initial_blocks,
+        reasoning=reasoning if reasoning is not None else "",
+        used_oracle_code=config["use_oracle_code"],
+    )
 
     with open(os.path.join(config["output_dir"], "all_responses.json"), "w") as f:
         json.dump(all_responses, f)
@@ -779,7 +1003,20 @@ def _run_single_trial(
 
     while code_block_idx < len(code_blocks) and code_block_idx <= MULTITURN_LIMIT:
         code = code_blocks[code_block_idx]
+        current_block_idx = code_block_idx
         code_block_idx += 1
+        phase_candidates = infer_phase_candidates(code)
+        phase_tags = phase_tags_from_candidates(phase_candidates)
+
+        pre_snapshot_id = append_snapshot(
+            trajectory_data,
+            env=env,
+            snapshot_type="pre_code",
+            code_block_idx=current_block_idx,
+            label=f"before_code_block_{current_block_idx:02d}",
+            phase_candidates=phase_candidates,
+            phase_tags=phase_tags,
+        )
 
         # Record frame index before step
         frame_start = env.get_video_frame_count() if recording_frames else 0
@@ -790,12 +1027,40 @@ def _run_single_trial(
         frame_end = env.get_video_frame_count() if recording_frames else 0
         turn_frame_ranges.append((frame_start, frame_end))
 
+        post_snapshot_id = append_snapshot(
+            trajectory_data,
+            env=env,
+            snapshot_type="post_code",
+            code_block_idx=current_block_idx,
+            label=f"after_code_block_{current_block_idx:02d}",
+            phase_candidates=phase_candidates,
+            phase_tags=phase_tags,
+        )
+        append_event(
+            trajectory_data,
+            "code_execution",
+            code_block_idx=current_block_idx,
+            code=code,
+            phase_candidates=phase_candidates,
+            phase_tags=phase_tags,
+            snapshot_before=pre_snapshot_id,
+            snapshot_after=post_snapshot_id,
+            reward=reward,
+            terminated=terminated,
+            truncated=truncated,
+            sandbox_rc=info_step.get("sandbox_rc"),
+            task_completed=info_step.get("task_completed"),
+            stdout=info_step.get("stdout", ""),
+            stderr=info_step.get("stderr", ""),
+        )
+
         if partial_artifacts is not None:
             partial_artifacts.update({
                 "info_step": info_step,
                 "reward": reward,
                 "terminated": terminated,
                 "truncated": truncated,
+                "trajectory_data": trajectory_data,
             })
 
         obs = obs_next
@@ -833,30 +1098,225 @@ def _run_single_trial(
             if decision == "regenerate":
                 print("Model chose to regenerate code")
                 new_blocks = _extract_code(new_code)
+                rollback_performed = False
+                rollback_snapshot_id = None
+                safe_snapshot_details = None
+                model_snapshot_selection_details = None
+                insert_idx = code_block_idx
+                if enable_eap_rollback:
+                    executed_code_for_selection = "\n".join(code_blocks[: current_block_idx + 1])
+                    if enable_eap_model_snapshot_selection:
+                        (
+                            selected_snapshot_id,
+                            safe_snapshot_details,
+                            model_snapshot_selection_details,
+                        ) = _select_safe_snapshot_with_model(
+                            args,
+                            obs,
+                            trajectory_data,
+                            current_code_block_idx=current_block_idx,
+                            purpose="regenerate",
+                            preferred_snapshot_id=pre_snapshot_id,
+                            executed_code=executed_code_for_selection,
+                            console_stdout=info_step.get("stdout", ""),
+                            console_stderr=info_step.get("stderr", ""),
+                        )
+                        append_event(
+                            trajectory_data,
+                            "model_snapshot_selection",
+                            code_block_idx=current_block_idx,
+                            purpose="regenerate",
+                            selection_prompt=model_snapshot_selection_details.get("selection_prompt")
+                            if config.get("save_multiturn_prompts", False)
+                            else None,
+                            **{
+                                key: value
+                                for key, value in model_snapshot_selection_details.items()
+                                if key not in {"selection_prompt", "purpose"}
+                            },
+                        )
+                    else:
+                        selected_snapshot_id, safe_snapshot_details = _select_safe_snapshot(
+                            trajectory_data,
+                            current_code_block_idx=current_block_idx,
+                            purpose="regenerate",
+                            preferred_snapshot_id=pre_snapshot_id,
+                        )
+                    append_event(
+                        trajectory_data,
+                        "safe_snapshot_selected",
+                        code_block_idx=current_block_idx,
+                        purpose="regenerate",
+                        **safe_snapshot_details,
+                    )
+                else:
+                    selected_snapshot_id = pre_snapshot_id
+
+                if enable_eap_rollback and selected_snapshot_id is not None:
+                    restored_obs, rollback_snapshot_id = _restore_rollback_snapshot(
+                        env,
+                        trajectory_data,
+                        selected_snapshot_id,
+                        code_block_idx=current_block_idx,
+                        reason="regenerate",
+                    )
+                    if restored_obs is not None:
+                        obs = restored_obs
+                        rollback_performed = True
+                        insert_idx = current_block_idx
                 all_responses.append({
                     "multi_turn_prompt": decision_prompt if config.get("save_multiturn_prompts", False) else None,
-                    "block_idx": [code_block_idx],
+                    "block_idx": [insert_idx],
                     "code_blocks": new_blocks,
                     "decision": "regenerate",
                     "reasoning": mt_reasoning if mt_reasoning is not None else "",
                 })
-                del code_blocks[code_block_idx:]
-                del code_block_metadata[code_block_idx:]
+                append_event(
+                    trajectory_data,
+                    "multi_turn_decision",
+                    code_block_idx=current_block_idx,
+                    decision="regenerate",
+                    reasoning=mt_reasoning if mt_reasoning is not None else "",
+                    replacement_code_blocks=new_blocks,
+                    rollback_performed=rollback_performed,
+                    rollback_snapshot_id=rollback_snapshot_id,
+                    safe_snapshot_details=safe_snapshot_details,
+                    model_snapshot_selection_details=model_snapshot_selection_details,
+                )
+                del code_blocks[insert_idx:]
+                del code_block_metadata[insert_idx:]
                 code_blocks.extend(new_blocks)
                 code_block_metadata.extend(
                     [{"generation": num_regenerations + 1, "regenerated": True,
-                      "regenerated_at_idx": code_block_idx}]
+                      "regenerated_at_idx": insert_idx}]
                     * len(new_blocks)
                 )
+                code_block_idx = insert_idx
                 num_regenerations += 1
                 if partial_artifacts is not None:
                     partial_artifacts["num_regenerations"] = num_regenerations
 
             elif decision == "finish":
+                attempted_recovery = False
+                model_snapshot_selection_details = None
+                if (
+                    enable_eap_recovery
+                    and num_recoveries < 1
+                    and not info_step.get("task_completed", False)
+                ):
+                    executed_code_for_selection = "\n".join(code_blocks[: current_block_idx + 1])
+                    if enable_eap_model_snapshot_selection:
+                        (
+                            selected_snapshot_id,
+                            safe_snapshot_details,
+                            model_snapshot_selection_details,
+                        ) = _select_safe_snapshot_with_model(
+                            args,
+                            obs,
+                            trajectory_data,
+                            current_code_block_idx=current_block_idx,
+                            purpose="finish_incomplete_recovery",
+                            preferred_snapshot_id=pre_snapshot_id,
+                            executed_code=executed_code_for_selection,
+                            console_stdout=info_step.get("stdout", ""),
+                            console_stderr=info_step.get("stderr", ""),
+                        )
+                        append_event(
+                            trajectory_data,
+                            "model_snapshot_selection",
+                            code_block_idx=current_block_idx,
+                            purpose="finish_incomplete_recovery",
+                            selection_prompt=model_snapshot_selection_details.get("selection_prompt")
+                            if config.get("save_multiturn_prompts", False)
+                            else None,
+                            **{
+                                key: value
+                                for key, value in model_snapshot_selection_details.items()
+                                if key not in {"selection_prompt", "purpose"}
+                            },
+                        )
+                    else:
+                        selected_snapshot_id, safe_snapshot_details = _select_safe_snapshot(
+                            trajectory_data,
+                            current_code_block_idx=current_block_idx,
+                            purpose="finish_incomplete_recovery",
+                            preferred_snapshot_id=pre_snapshot_id,
+                        )
+                    append_event(
+                        trajectory_data,
+                        "safe_snapshot_selected",
+                        code_block_idx=current_block_idx,
+                        purpose="finish_incomplete_recovery",
+                        **safe_snapshot_details,
+                    )
+                    if selected_snapshot_id is not None:
+                        restored_obs, rollback_snapshot_id = _restore_rollback_snapshot(
+                            env,
+                            trajectory_data,
+                            selected_snapshot_id,
+                            code_block_idx=current_block_idx,
+                            reason="finish_incomplete_recovery",
+                        )
+                    else:
+                        restored_obs, rollback_snapshot_id = None, None
+
+                    if restored_obs is not None:
+                        obs = restored_obs
+                        recovery_raw_code, recovery_reasoning, recovery_prompt = _query_recovery_code(
+                            args,
+                            obs,
+                            executed_code="\n".join(code_blocks[:code_block_idx]),
+                            console_stdout=info_step.get("stdout", ""),
+                            console_stderr=info_step.get("stderr", ""),
+                            recovery_reason="model_finished_but_task_incomplete",
+                        )
+                        recovery_blocks = _extract_code(recovery_raw_code)
+                        if recovery_blocks:
+                            insert_idx = current_block_idx
+                            all_responses.append({
+                                "multi_turn_prompt": recovery_prompt if config.get("save_multiturn_prompts", False) else None,
+                                "block_idx": [insert_idx],
+                                "code_blocks": recovery_blocks,
+                                "decision": "recovery",
+                                "reasoning": recovery_reasoning if recovery_reasoning is not None else "",
+                            })
+                            append_event(
+                                trajectory_data,
+                                "recovery_generation",
+                                code_block_idx=current_block_idx,
+                                reason="model_finished_but_task_incomplete",
+                                rollback_snapshot_id=rollback_snapshot_id,
+                                safe_snapshot_details=safe_snapshot_details,
+                                model_snapshot_selection_details=model_snapshot_selection_details,
+                                replacement_code_blocks=recovery_blocks,
+                            )
+                            del code_blocks[insert_idx:]
+                            del code_block_metadata[insert_idx:]
+                            code_blocks.extend(recovery_blocks)
+                            code_block_metadata.extend(
+                                [{"generation": num_regenerations + num_recoveries + 1, "regenerated": True,
+                                  "regenerated_at_idx": insert_idx, "recovery": True}]
+                                * len(recovery_blocks)
+                            )
+                            code_block_idx = insert_idx
+                            num_recoveries += 1
+                            attempted_recovery = True
+
+                if attempted_recovery:
+                    continue
+
                 all_responses.append({
                     "decision": "finish",
                     "reasoning": mt_reasoning if mt_reasoning is not None else (new_code or ""),
                 })
+                append_event(
+                    trajectory_data,
+                    "multi_turn_decision",
+                    code_block_idx=current_block_idx,
+                    decision="finish",
+                    reasoning=mt_reasoning if mt_reasoning is not None else (new_code or ""),
+                    attempted_recovery=attempted_recovery,
+                )
                 print("Model chose to finish")
                 num_finishes += 1
                 if partial_artifacts is not None:
@@ -906,12 +1366,28 @@ def _run_single_trial(
         stderr_override=stderr,
     )
 
+    success = info_step["sandbox_rc"] == 0
+    append_event(
+        trajectory_data,
+        "trial_complete",
+        success=success,
+        reward=reward,
+        terminated=terminated,
+        truncated=truncated,
+        sandbox_rc=info_step["sandbox_rc"],
+        task_completed=info_step.get("task_completed", False),
+        num_regenerations=num_regenerations,
+        num_finishes=num_finishes,
+        num_code_blocks=num_code_blocks,
+    )
+
     code_path = _save_trial_artifacts(
         config, trial, info_step["sandbox_rc"], reward,
         info_step.get("task_completed", False), final_code, raw_code,
         all_responses, log_lines, visual_feedback_imgs,
         ensemble_data=ensemble_data,
         multiturn_ensemble_data=multiturn_ensemble_data,
+        trajectory_data=trajectory_data,
     )
 
     # Save per-turn and combined videos
@@ -921,8 +1397,6 @@ def _run_single_trial(
         )
     else:
         _save_trial_video(env, config, trial, info_step, reward, num_code_blocks)
-
-    success = info_step["sandbox_rc"] == 0
 
     # --- Evolving skill library integration (opt-in) ---
     if config.get("evolve_skill_library", False) and info_step.get("task_completed", False):
@@ -974,3 +1448,233 @@ def _patch_libero_goal(env: CodeExecutionEnvBase, obs: dict[str, Any]) -> None:
                 libero_environment_goal=goal
             )
         )
+
+
+def _restore_rollback_snapshot(
+    env: CodeExecutionEnvBase,
+    trajectory_data: dict[str, Any],
+    snapshot_id: str,
+    *,
+    code_block_idx: int,
+    reason: str,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Restore a previously captured snapshot and append rollback metadata."""
+    snapshot_payloads = trajectory_data.get("_snapshot_payloads", {})
+    snapshot_state = snapshot_payloads.get(snapshot_id)
+    if snapshot_state is None:
+        return None, None
+    source_snapshot_meta = next(
+        (snapshot for snapshot in trajectory_data.get("snapshots", []) if snapshot.get("snapshot_id") == snapshot_id),
+        None,
+    )
+    source_phase_candidates = source_snapshot_meta.get("phase_candidates", []) if source_snapshot_meta else []
+    source_phase_tags = source_snapshot_meta.get("phase_tags", []) if source_snapshot_meta else []
+
+    env.restore_state(snapshot_state)
+    restored_snapshot_id = append_snapshot(
+        trajectory_data,
+        env=env,
+        snapshot_type="rollback_restore",
+        code_block_idx=code_block_idx,
+        label=f"rollback_after_code_block_{code_block_idx:02d}",
+        phase_candidates=source_phase_candidates,
+        phase_tags=source_phase_tags,
+    )
+    append_event(
+        trajectory_data,
+        "rollback",
+        code_block_idx=code_block_idx,
+        reason=reason,
+        source_snapshot_id=snapshot_id,
+        restored_snapshot_id=restored_snapshot_id,
+    )
+
+    obs = env._get_observation()
+    _patch_libero_goal(env, obs)
+    return obs, restored_snapshot_id
+
+
+def _is_open_gripper_state(state: dict[str, Any]) -> bool:
+    gripper_fraction = state.get("gripper_fraction")
+    if gripper_fraction is not None:
+        return float(gripper_fraction) >= 0.9
+
+    current_obs = state.get("current_obs")
+    if isinstance(current_obs, dict):
+        robot_joint_pos = current_obs.get("robot_joint_pos")
+        if robot_joint_pos is not None and len(robot_joint_pos) > 0:
+            return float(np.asarray(robot_joint_pos)[-1]) >= 0.9
+    return False
+
+
+def _collect_safe_snapshot_candidates(
+    trajectory_data: dict[str, Any],
+    *,
+    current_code_block_idx: int,
+) -> list[dict[str, Any]]:
+    snapshots = trajectory_data.get("snapshots", [])
+    snapshot_payloads = trajectory_data.get("_snapshot_payloads", {})
+
+    allowed_types = {"reset", "pre_code", "rollback_restore"}
+    candidates: list[dict[str, Any]] = []
+    for snapshot_meta in snapshots:
+        snapshot_id = snapshot_meta.get("snapshot_id")
+        if snapshot_id is None or snapshot_meta.get("snapshot_type") not in allowed_types:
+            continue
+        code_block_idx = snapshot_meta.get("code_block_idx")
+        if code_block_idx is not None and code_block_idx > current_code_block_idx:
+            continue
+        state = snapshot_payloads.get(snapshot_id)
+        if state is None:
+            continue
+        candidates.append(
+            {
+                "snapshot_id": snapshot_id,
+                "snapshot_type": snapshot_meta.get("snapshot_type"),
+                "code_block_idx": code_block_idx,
+                "is_open_gripper": _is_open_gripper_state(state),
+                "phase_tags": snapshot_meta.get("phase_tags", []),
+                "summary": snapshot_meta.get("summary", {}),
+            }
+        )
+    return candidates
+
+
+def _preferred_safe_snapshot_phases(purpose: str) -> list[str]:
+    preferred_phases_by_purpose = {
+        "regenerate": ["prepare_grasp", "perceive", "plan_grasp", "home"],
+        "finish_incomplete_recovery": ["prepare_grasp", "perceive", "plan_grasp", "home", "release"],
+    }
+    return preferred_phases_by_purpose.get(
+        purpose,
+        ["prepare_grasp", "perceive", "plan_grasp", "home"],
+    )
+
+
+def _select_safe_snapshot(
+    trajectory_data: dict[str, Any],
+    *,
+    current_code_block_idx: int,
+    purpose: str,
+    preferred_snapshot_id: str | None = None,
+) -> tuple[str | None, dict[str, Any]]:
+    candidates = _collect_safe_snapshot_candidates(
+        trajectory_data,
+        current_code_block_idx=current_code_block_idx,
+    )
+    preferred_phases = _preferred_safe_snapshot_phases(purpose)
+
+    selection_details = {
+        "candidate_count": len(candidates),
+        "candidate_snapshot_ids": [candidate["snapshot_id"] for candidate in candidates],
+        "preferred_snapshot_id": preferred_snapshot_id,
+        "preferred_phases": preferred_phases,
+        "strategy": "latest_preferred_phase_and_open_gripper_else_latest_open_gripper_else_latest_candidate",
+    }
+    if not candidates:
+        return None, selection_details
+
+    phase_and_open_candidates = [
+        candidate
+        for candidate in candidates
+        if candidate["is_open_gripper"]
+        and any(tag in preferred_phases for tag in candidate.get("phase_tags", []))
+    ]
+    open_candidates = [candidate for candidate in candidates if candidate["is_open_gripper"]]
+    if phase_and_open_candidates:
+        selected = phase_and_open_candidates[-1]
+    elif open_candidates:
+        selected = open_candidates[-1]
+    else:
+        selected = candidates[-1]
+
+    if preferred_snapshot_id is not None:
+        preferred = next((c for c in candidates if c["snapshot_id"] == preferred_snapshot_id), None)
+        if preferred is not None and preferred["is_open_gripper"]:
+            selected = preferred
+            selection_details["strategy"] = "preferred_snapshot_is_safe"
+
+    selection_details["selected_snapshot_id"] = selected["snapshot_id"]
+    selection_details["selected_snapshot_type"] = selected["snapshot_type"]
+    selection_details["selected_snapshot_code_block_idx"] = selected["code_block_idx"]
+    selection_details["selected_snapshot_open_gripper"] = selected["is_open_gripper"]
+    selection_details["selected_snapshot_phase_tags"] = selected.get("phase_tags", [])
+    return selected["snapshot_id"], selection_details
+
+
+def _select_safe_snapshot_with_model(
+    args: LaunchArgs,
+    obs: dict[str, Any],
+    trajectory_data: dict[str, Any],
+    *,
+    current_code_block_idx: int,
+    purpose: str,
+    preferred_snapshot_id: str | None = None,
+    executed_code: str,
+    console_stdout: str,
+    console_stderr: str,
+) -> tuple[str | None, dict[str, Any], dict[str, Any]]:
+    heuristic_selected_snapshot_id, heuristic_details = _select_safe_snapshot(
+        trajectory_data,
+        current_code_block_idx=current_code_block_idx,
+        purpose=purpose,
+        preferred_snapshot_id=preferred_snapshot_id,
+    )
+    candidates = _collect_safe_snapshot_candidates(
+        trajectory_data,
+        current_code_block_idx=current_code_block_idx,
+    )
+    preferred_phases = _preferred_safe_snapshot_phases(purpose)
+    model_details: dict[str, Any] = {
+        "purpose": purpose,
+        "candidate_count": len(candidates),
+        "candidate_snapshot_ids": [candidate["snapshot_id"] for candidate in candidates],
+        "heuristic_selected_snapshot_id": heuristic_selected_snapshot_id,
+    }
+    if not candidates:
+        model_details["fallback_used"] = True
+        model_details["fallback_reason"] = "no_candidates"
+        return heuristic_selected_snapshot_id, heuristic_details, model_details
+
+    model_selected_snapshot_id, raw_content, reasoning, selection_prompt, parsed_reason = _query_snapshot_selection(
+        args,
+        obs,
+        purpose=purpose,
+        candidates=candidates,
+        preferred_phases=preferred_phases,
+        executed_code=executed_code,
+        console_stdout=console_stdout,
+        console_stderr=console_stderr,
+    )
+    model_details.update({
+        "raw_response": raw_content,
+        "reasoning": reasoning,
+        "selection_prompt": selection_prompt,
+        "parsed_reason": parsed_reason,
+        "model_selected_snapshot_id": model_selected_snapshot_id,
+    })
+
+    candidate_ids = {candidate["snapshot_id"] for candidate in candidates}
+    if model_selected_snapshot_id not in candidate_ids:
+        model_details["fallback_used"] = True
+        model_details["fallback_reason"] = "invalid_model_selection"
+        return heuristic_selected_snapshot_id, heuristic_details, model_details
+
+    selected_candidate = next(
+        candidate for candidate in candidates if candidate["snapshot_id"] == model_selected_snapshot_id
+    )
+    selection_details = dict(heuristic_details)
+    selection_details.update({
+        "strategy": "model_selected_candidate",
+        "selected_snapshot_id": selected_candidate["snapshot_id"],
+        "selected_snapshot_type": selected_candidate["snapshot_type"],
+        "selected_snapshot_code_block_idx": selected_candidate["code_block_idx"],
+        "selected_snapshot_open_gripper": selected_candidate["is_open_gripper"],
+        "selected_snapshot_phase_tags": selected_candidate.get("phase_tags", []),
+        "model_selected_snapshot_id": model_selected_snapshot_id,
+        "heuristic_selected_snapshot_id": heuristic_selected_snapshot_id,
+    })
+    model_details["fallback_used"] = False
+    model_details["fallback_reason"] = None
+    model_details["final_selected_snapshot_id"] = model_selected_snapshot_id
+    return model_selected_snapshot_id, selection_details, model_details
