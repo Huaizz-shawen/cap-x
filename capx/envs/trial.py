@@ -904,6 +904,11 @@ def _run_single_trial(
         config_path=args.config_path,
         task_prompt=obs["full_prompt"][-1]["content"][0]["text"],
     )
+    transition_dataset = env.get_transition_dataset() if hasattr(env, "get_transition_dataset") else None
+    if transition_dataset is not None:
+        transition_dataset["trial"] = trial
+        transition_dataset["config_path"] = args.config_path
+        transition_dataset["task_prompt"] = obs["full_prompt"][-1]["content"][0]["text"]
     reset_state = env.get_reset_state() if hasattr(env, "get_reset_state") else None
     reset_snapshot_id = append_snapshot(
         trajectory_data,
@@ -960,6 +965,7 @@ def _run_single_trial(
             "ensemble_data": ensemble_data,
             "multiturn_ensemble_data": multiturn_ensemble_data,
             "trajectory_data": trajectory_data,
+            "transition_dataset": transition_dataset,
         })
 
     # Parse initial code into blocks
@@ -1060,8 +1066,9 @@ def _run_single_trial(
                 "reward": reward,
                 "terminated": terminated,
                 "truncated": truncated,
-                "trajectory_data": trajectory_data,
-            })
+            "trajectory_data": trajectory_data,
+            "transition_dataset": transition_dataset,
+        })
 
         obs = obs_next
 
@@ -1388,7 +1395,25 @@ def _run_single_trial(
         ensemble_data=ensemble_data,
         multiturn_ensemble_data=multiturn_ensemble_data,
         trajectory_data=trajectory_data,
+        transition_dataset=transition_dataset,
     )
+
+    final_summary = TrialSummary(
+        trial=trial,
+        success=success,
+        reward=reward,
+        terminated=terminated,
+        truncated=truncated,
+        sandbox_rc=info_step["sandbox_rc"],
+        log="\n".join(log_lines),
+        task_completed=info_step.get("task_completed", None),
+        code_path=code_path,
+        num_regenerations=num_regenerations,
+        num_finishes=num_finishes,
+        num_code_blocks=num_code_blocks,
+    )
+    if partial_artifacts is not None:
+        partial_artifacts["final_summary"] = final_summary
 
     # Save per-turn and combined videos
     if recording_frames and turn_frame_ranges:
@@ -1417,20 +1442,7 @@ def _run_single_trial(
 
     gc.collect()
 
-    return TrialSummary(
-        trial=trial,
-        success=success,
-        reward=reward,
-        terminated=terminated,
-        truncated=truncated,
-        sandbox_rc=info_step["sandbox_rc"],
-        log="\n".join(log_lines),
-        task_completed=info_step.get("task_completed", None),
-        code_path=code_path,
-        num_regenerations=num_regenerations,
-        num_finishes=num_finishes,
-        num_code_blocks=num_code_blocks,
-    )
+    return final_summary
 
 
 def _patch_libero_goal(env: CodeExecutionEnvBase, obs: dict[str, Any]) -> None:

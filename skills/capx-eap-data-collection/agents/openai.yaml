@@ -1,0 +1,4 @@
+interface:
+  display_name: "CaP-X EAP Collection"
+  short_description: "Run CaP-X collection and LeRobot export workflows"
+  default_prompt: "Use $capx-eap-data-collection to run a CaP-X collection job, export it to LeRobot, and validate the dataset."

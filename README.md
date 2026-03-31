@@ -31,6 +31,56 @@ Shankar Sastry<sup>2</sup>, Yuke Zhu<sup>1</sup>, Ken Goldberg<sup>&dagger;,2</s
 
 ---
 
+## Automated Data Collection Workflow
+
+This repository now also supports an automated simulation data-collection workflow built around the existing `code-as-policy` execution loop. In this workflow, the outer orchestration agent controls experiment launch, monitoring, export, and validation, while the in-environment CaP-X agent remains the task-execution sub-agent.
+
+Key pieces of the workflow:
+
+- **Structured transition capture**: low-level simulation steps are recorded as `observation + action + timestamp` trajectories, including failed runs.
+- **EAP-style recovery in simulation**: for LIBERO, the environment can save exact simulator snapshots, roll back to a safe snapshot after failure, and attempt recovery code from that restored state.
+- **Self-resetting collection loops**: successful or failed episodes can be returned to a canonical reset state or an intermediate safe state without manual intervention.
+- **Training-ready export**: collected trajectories can be converted into LeRobot-compatible `dtype=video` datasets with compressed MP4 video plus parquet low-dimensional state/action tables.
+
+The current recovery stack in simulation supports:
+
+- deterministic `capture_state()` / `restore_state()` rewind for LIBERO
+- rollback to safe snapshots before regeneration
+- optional model-based snapshot selection over a constrained candidate set
+- trajectory, recovery, and rollback metadata saved alongside each trial
+
+This is intended for automated dataset production for downstream policy, VLA, or world-action-model training, not only for benchmark reporting.
+
+For agent-facing orchestration, a repository-local skill is included under [skills/capx-eap-data-collection](/media/user/B29202FA9202C2B91/cap-x/skills/capx-eap-data-collection). To install repository skills onto a new device, use [sync_repo_skills.sh](/media/user/B29202FA9202C2B91/cap-x/scripts/sync_repo_skills.sh):
+
+```bash
+./scripts/sync_repo_skills.sh
+```
+
+This copies all repo-local skills from `./skills` into `~/.codex/skills`.
+
+### Data Collection Quick Start
+
+The command below runs a small LIBERO privileged collection job, exports the result into LeRobot `dtype=video`, and validates the exported dataset with the official loader:
+
+```bash
+source .venv-libero/bin/activate
+python skills/capx-eap-data-collection/scripts/capx_eap_pipeline.py collect-export \
+  --repo-root /media/user/B29202FA9202C2B91/cap-x \
+  --config-path env_configs/libero/franka_libero_goal_1_privileged.yaml \
+  --output-dir outputs/gpt-5.3-codex/quickstart_goal1 \
+  --lerobot-output-root outputs/lerobot/quickstart_goal1 \
+  --server-url http://10.11.18.197:8317/v1/chat/completions \
+  --api-key YOUR_KEY \
+  --model gpt-5.3-codex \
+  --total-trials 1 \
+  --enable-eap-rollback \
+  --enable-eap-recovery \
+  --validate
+```
+
+---
+
 ## Installation
 
 CaP-X uses [uv](https://docs.astral.sh/uv/) for dependency management. Requires **Python 3.10** and a **CUDA-capable GPU**.

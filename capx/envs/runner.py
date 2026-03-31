@@ -307,6 +307,10 @@ def _run_single_trial_with_timeout(
 
         if not is_timeout:
             raise
+        final_summary = partial_artifacts.get("final_summary")
+        if isinstance(final_summary, TrialSummary):
+            print(f"Trial {trial} timed out during post-processing; returning finalized summary")
+            return final_summary
         if raise_on_timeout:
             raise TimeoutError(f"Trial {trial} timed out") from exc
 
@@ -350,6 +354,7 @@ def _build_timeout_summary(
     )
 
     trajectory_data = pa.get("trajectory_data")
+    transition_dataset = pa.get("transition_dataset")
     if trajectory_data is not None:
         append_event(
             trajectory_data,
@@ -379,6 +384,7 @@ def _build_timeout_summary(
         ensemble_data=pa.get("ensemble_data"),
         multiturn_ensemble_data=pa.get("multiturn_ensemble_data", []),
         trajectory_data=trajectory_data,
+        transition_dataset=transition_dataset,
     )
 
     return TrialSummary(

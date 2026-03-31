@@ -91,6 +91,10 @@ class BaseEnv(Env):
         """Return the canonical post-reset state, if the environment tracks one."""
         return None
 
+    def get_transition_dataset(self) -> dict[str, Any] | None:
+        """Return low-level transition data captured during the current episode, if available."""
+        return None
+
 
 # Use user's BaseEnv for low-level envs
 

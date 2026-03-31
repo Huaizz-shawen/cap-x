@@ -321,6 +321,11 @@ class CodeExecutionEnvBase(Env):
             return self.low_level_env.get_reset_state()
         return None
 
+    def get_transition_dataset(self) -> dict[str, Any] | None:
+        if hasattr(self.low_level_env, "get_transition_dataset"):
+            return self.low_level_env.get_transition_dataset()
+        return None
+
     # Video passthrough for demo compatibility
     def enable_video_capture(
         self,

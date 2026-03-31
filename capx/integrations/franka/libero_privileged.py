@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from typing import Any, Callable, Tuple
 
 import numpy as np
@@ -15,6 +16,11 @@ class FrankaLiberoPrivilegedApi(ApiBase):
     """
 
     _TCP_OFFSET = np.array([0.0, 0.0, -0.1], dtype=np.float64)
+
+    def _action_context(self, action_name: str, **metadata: Any):
+        if hasattr(self._env, "action_context"):
+            return self._env.action_context(action_name, **metadata)
+        return nullcontext()
 
     def __init__(self, env: BaseEnv) -> None:
         super().__init__(env)
@@ -116,54 +122,60 @@ class FrankaLiberoPrivilegedApi(ApiBase):
 
         pos = np.asarray(position, dtype=np.float64).reshape(3)
         quat_wxyz = np.asarray(quaternion_wxyz, dtype=np.float64).reshape(4)
-        # Align with legacy env: apply TCP offset in end-effector frame
-        quat_xyzw = np.array(
-            [quat_wxyz[1], quat_wxyz[2], quat_wxyz[3], quat_wxyz[0]], dtype=np.float64
-        )
-        rot = SciRotation.from_quat(quat_xyzw)
-        offset_pos = pos + rot.apply(self._TCP_OFFSET)
+        with self._action_context(
+            "goto_pose",
+            position=pos,
+            quaternion_wxyz=quat_wxyz,
+            z_approach=float(z_approach),
+        ):
+            # Align with legacy env: apply TCP offset in end-effector frame
+            quat_xyzw = np.array(
+                [quat_wxyz[1], quat_wxyz[2], quat_wxyz[3], quat_wxyz[0]], dtype=np.float64
+            )
+            rot = SciRotation.from_quat(quat_xyzw)
+            offset_pos = pos + rot.apply(self._TCP_OFFSET)
 
-        if (
-            z_approach != 0.0
-        ):  # If z_approach is not 0.0, approach the object from above by z_approach meters
-            z_offset_pos = offset_pos + rot.apply(np.array([0, 0, -z_approach]))
+            if (
+                z_approach != 0.0
+            ):  # If z_approach is not 0.0, approach the object from above by z_approach meters
+                z_offset_pos = offset_pos + rot.apply(np.array([0, 0, -z_approach]))
+
+                if self.cfg is None:
+                    self.cfg = self._pks.solve_ik(
+                        robot=self._robot,
+                        target_link_name=self._target_link_name,
+                        target_position=z_offset_pos,
+                        target_wxyz=quat_wxyz,
+                    )
+                else:
+                    self.cfg = self._pks.solve_ik_vel_cost(
+                        robot=self._robot,
+                        target_link_name=self._target_link_name,
+                        target_position=z_offset_pos,
+                        target_wxyz=quat_wxyz,
+                        prev_cfg=self.cfg,
+                    )
+                joints_z_offset = np.asarray(self.cfg[:-1], dtype=np.float64).reshape(7)
+
+                self._env.move_to_joints_blocking(joints_z_offset)
 
             if self.cfg is None:
                 self.cfg = self._pks.solve_ik(
                     robot=self._robot,
                     target_link_name=self._target_link_name,
-                    target_position=z_offset_pos,
+                    target_position=offset_pos,
                     target_wxyz=quat_wxyz,
                 )
             else:
                 self.cfg = self._pks.solve_ik_vel_cost(
                     robot=self._robot,
                     target_link_name=self._target_link_name,
-                    target_position=z_offset_pos,
+                    target_position=offset_pos,
                     target_wxyz=quat_wxyz,
                     prev_cfg=self.cfg,
                 )
-            joints_z_offset = np.asarray(self.cfg[:-1], dtype=np.float64).reshape(7)
-
-            self._env.move_to_joints_blocking(joints_z_offset)
-
-        if self.cfg is None:
-            self.cfg = self._pks.solve_ik(
-                robot=self._robot,
-                target_link_name=self._target_link_name,
-                target_position=offset_pos,
-                target_wxyz=quat_wxyz,
-            )
-        else:
-            self.cfg = self._pks.solve_ik_vel_cost(
-                robot=self._robot,
-                target_link_name=self._target_link_name,
-                target_position=offset_pos,
-                target_wxyz=quat_wxyz,
-                prev_cfg=self.cfg,
-            )
-        joints = np.asarray(self.cfg[:-1], dtype=np.float64).reshape(7)
-        self._env.move_to_joints_blocking(joints)
+            joints = np.asarray(self.cfg[:-1], dtype=np.float64).reshape(7)
+            self._env.move_to_joints_blocking(joints)
 
     def goto_pose_interactive_cartesian(self, target_pose_predicate: Callable[[], Tuple[np.ndarray, np.ndarray]], replan_interval_s: float = 0.0, lin_vel_norm: float = 1.0, ang_vel_norm: float = 2.0, z_approach: float = 0.0, timeout_s: float = 20.0) -> None:
         """Go to pose using Inverse Kinematics.
@@ -178,64 +190,72 @@ class FrankaLiberoPrivilegedApi(ApiBase):
         Returns:
             None
         """
-        position, quaternion_wxyz = target_pose_predicate()
+        with self._action_context(
+            "goto_pose_interactive_cartesian",
+            replan_interval_s=float(replan_interval_s),
+            lin_vel_norm=float(lin_vel_norm),
+            ang_vel_norm=float(ang_vel_norm),
+            z_approach=float(z_approach),
+            timeout_s=float(timeout_s),
+        ):
+            position, quaternion_wxyz = target_pose_predicate()
 
-        pos = np.asarray(position, dtype=np.float64).reshape(3)
-        quat_wxyz = np.asarray(quaternion_wxyz, dtype=np.float64).reshape(4)
-        # Align with legacy env: apply TCP offset in end-effector frame
-        quat_xyzw = np.array(
-            [quat_wxyz[1], quat_wxyz[2], quat_wxyz[3], quat_wxyz[0]], dtype=np.float64
-        )
-        rot = SciRotation.from_quat(quat_xyzw)
-        offset_pos = pos + rot.apply(self._TCP_OFFSET)
-
-        if (z_approach != 0.0):
-            def target_pose_predicate_z_offset():
-                pos, quat = target_pose_predicate()
-                r = SciRotation.from_quat(quat, scalar_first=True)
-                return pos + r.apply(np.array([0, 0, -z_approach])), quat
-
-            self.goto_pose_interactive_cartesian(target_pose_predicate_z_offset, replan_interval_s, lin_vel_norm, ang_vel_norm, z_approach=0.0, timeout_s=timeout_s)
-
-        robot_cartesian_pos = self._env.get_observation()["robot_cartesian_pos"]
-        current_position = robot_cartesian_pos[:3]
-        current_quaternion_wxyz = robot_cartesian_pos[3:7]
-        current_target_position = current_position.copy()
-        current_target_quaternion_wxyz = current_quaternion_wxyz.copy()
-        last_plan_time_s = self._env.get_current_time_s()
-        start_loop_time_s = self._env.get_current_time_s()
-
-        loop_executed = False
-        while not np.allclose(offset_pos, current_target_position) or not np.allclose(quaternion_wxyz, current_target_quaternion_wxyz):
-            loop_executed = True
-            current_time_s = self._env.get_current_time_s()
-            delta_t = current_time_s - last_plan_time_s
-            if timeout_s > 0 and current_time_s - start_loop_time_s > timeout_s:
-                break
-            if replan_interval_s > 0 and delta_t > replan_interval_s:
-                offset_pos, quaternion_wxyz = target_pose_predicate()
-                last_plan_time_s = current_time_s
-                robot_cartesian_pos = self._env.get_observation()["robot_cartesian_pos"]
-                current_position = robot_cartesian_pos[:3]
-                current_quaternion_wxyz = robot_cartesian_pos[3:7]
-
-            current_target_position, current_target_quaternion_wxyz = self.step_towards_pose(
-                current_position, current_quaternion_wxyz, offset_pos, quaternion_wxyz, lin_vel_norm, ang_vel_norm, 1.0 / self._env._control_freq
+            pos = np.asarray(position, dtype=np.float64).reshape(3)
+            quat_wxyz = np.asarray(quaternion_wxyz, dtype=np.float64).reshape(4)
+            # Align with legacy env: apply TCP offset in end-effector frame
+            quat_xyzw = np.array(
+                [quat_wxyz[1], quat_wxyz[2], quat_wxyz[3], quat_wxyz[0]], dtype=np.float64
             )
-            current_position = current_target_position
-            current_quaternion_wxyz = current_target_quaternion_wxyz
+            rot = SciRotation.from_quat(quat_xyzw)
+            offset_pos = pos + rot.apply(self._TCP_OFFSET)
 
-            self.cfg = self._pks.solve_ik_vel_cost(
-                robot=self._robot,
-                target_link_name=self._target_link_name,
-                target_position=current_target_position,
-                target_wxyz=current_target_quaternion_wxyz,
-                prev_cfg=self.cfg,
-            )
-            joints = np.asarray(self.cfg[:-1], dtype=np.float64).reshape(7)
-            self._env.move_to_joints_blocking(joints, max_steps=1)
-        if loop_executed:
-            self._env.move_to_joints_blocking(joints)
+            if (z_approach != 0.0):
+                def target_pose_predicate_z_offset():
+                    pos, quat = target_pose_predicate()
+                    r = SciRotation.from_quat(quat, scalar_first=True)
+                    return pos + r.apply(np.array([0, 0, -z_approach])), quat
+
+                self.goto_pose_interactive_cartesian(target_pose_predicate_z_offset, replan_interval_s, lin_vel_norm, ang_vel_norm, z_approach=0.0, timeout_s=timeout_s)
+
+            robot_cartesian_pos = self._env.get_observation()["robot_cartesian_pos"]
+            current_position = robot_cartesian_pos[:3]
+            current_quaternion_wxyz = robot_cartesian_pos[3:7]
+            current_target_position = current_position.copy()
+            current_target_quaternion_wxyz = current_quaternion_wxyz.copy()
+            last_plan_time_s = self._env.get_current_time_s()
+            start_loop_time_s = self._env.get_current_time_s()
+
+            loop_executed = False
+            while not np.allclose(offset_pos, current_target_position) or not np.allclose(quaternion_wxyz, current_target_quaternion_wxyz):
+                loop_executed = True
+                current_time_s = self._env.get_current_time_s()
+                delta_t = current_time_s - last_plan_time_s
+                if timeout_s > 0 and current_time_s - start_loop_time_s > timeout_s:
+                    break
+                if replan_interval_s > 0 and delta_t > replan_interval_s:
+                    offset_pos, quaternion_wxyz = target_pose_predicate()
+                    last_plan_time_s = current_time_s
+                    robot_cartesian_pos = self._env.get_observation()["robot_cartesian_pos"]
+                    current_position = robot_cartesian_pos[:3]
+                    current_quaternion_wxyz = robot_cartesian_pos[3:7]
+
+                current_target_position, current_target_quaternion_wxyz = self.step_towards_pose(
+                    current_position, current_quaternion_wxyz, offset_pos, quaternion_wxyz, lin_vel_norm, ang_vel_norm, 1.0 / self._env._control_freq
+                )
+                current_position = current_target_position
+                current_quaternion_wxyz = current_target_quaternion_wxyz
+
+                self.cfg = self._pks.solve_ik_vel_cost(
+                    robot=self._robot,
+                    target_link_name=self._target_link_name,
+                    target_position=current_target_position,
+                    target_wxyz=current_target_quaternion_wxyz,
+                    prev_cfg=self.cfg,
+                )
+                joints = np.asarray(self.cfg[:-1], dtype=np.float64).reshape(7)
+                self._env.move_to_joints_blocking(joints, max_steps=1)
+            if loop_executed:
+                self._env.move_to_joints_blocking(joints)
 
     def open_gripper(self) -> None:
         """Open gripper fully.
@@ -243,9 +263,10 @@ class FrankaLiberoPrivilegedApi(ApiBase):
         Args:
             None
         """
-        self._env._set_gripper(1.0)
-        for _ in range(40):
-            self._env._step_once()
+        with self._action_context("open_gripper", target_fraction=1.0):
+            self._env._set_gripper(1.0)
+            for _ in range(40):
+                self._env._step_once()
 
     def close_gripper(self) -> None:
         """Close gripper fully.
@@ -253,9 +274,10 @@ class FrankaLiberoPrivilegedApi(ApiBase):
         Args:
             None
         """
-        self._env._set_gripper(0.0)
-        for _ in range(60):
-            self._env._step_once()
+        with self._action_context("close_gripper", target_fraction=0.0):
+            self._env._set_gripper(0.0)
+            for _ in range(60):
+                self._env._step_once()
 
     def breakpoint_code_block(self) -> None:
         """Call this function to mark a significant checkpoint where you want to evaluate progress and potentially regenerate the remaining code.

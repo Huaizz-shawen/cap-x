@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+import time
+from contextlib import contextmanager
 from typing import Any, Literal
 
 import numpy as np
@@ -12,6 +14,11 @@ from robot_descriptions.loaders.yourdfpy import load_robot_description
 from viser.extras import ViserUrdf
 
 from capx.envs.base import BaseEnv
+from capx.envs.transition_dataset import (
+    append_transition,
+    create_transition_dataset,
+    set_initial_observation,
+)
 from capx.integrations.libero import load_libero_task
 from capx.utils.camera_utils import obs_get_rgb
 from capx.utils.depth_utils import depth_color_to_pointcloud
@@ -70,6 +77,8 @@ class FrankaLiberoEnv(BaseEnv):
         self._wrist_camera_name = "robot0_eye_in_hand"
         self._subsample_rate = 4
         self._reset_state: dict[str, Any] | None = None
+        self._transition_dataset: dict[str, Any] | None = None
+        self._action_context_stack: list[dict[str, Any]] = []
 
         # Robot link indices for transforms
         self.gripper_metric_length = 0.04
@@ -174,6 +183,11 @@ class FrankaLiberoEnv(BaseEnv):
             ]
         )
         self._reset_state = self._build_state_snapshot()
+        self._transition_dataset = create_transition_dataset(
+            trial=seed if seed is not None else 0,
+            task_prompt=self.handle.task_language,
+        )
+        set_initial_observation(self._transition_dataset, obs)
 
         info = {"task_prompt": self.handle.task_language}
         return obs, info
@@ -206,6 +220,9 @@ class FrankaLiberoEnv(BaseEnv):
 
         steps = 0
         while steps < max_steps:
+            if self._episode_is_done():
+                break
+
             # Get current joint positions
             current = np.array(
                 self.handle.env.sim.data.qpos[self._panda_joint_qpos_addrs], dtype=np.float64
@@ -241,7 +258,22 @@ class FrankaLiberoEnv(BaseEnv):
             if self._record_frames and self._sim_step_count % self._subsample_rate == 0:
                 self._record_frame()
 
+            self._record_transition(
+                action=action,
+                source="move_to_joints_blocking",
+                metadata={
+                    "target_joints": target,
+                    "joint_error": float(error),
+                    "controller_step_idx": steps,
+                    "max_steps": max_steps,
+                    "tolerance": tolerance,
+                },
+            )
+
             steps += 1
+
+            if self._episode_is_done():
+                break
 
     def _set_gripper(self, fraction: float) -> None:
         """Set gripper opening fraction.
@@ -251,8 +283,11 @@ class FrankaLiberoEnv(BaseEnv):
         """
         self._gripper_fraction = float(np.clip(fraction, 0.0, 1.0))
 
-    def _step_once(self) -> None:
+    def _step_once(self) -> bool:
         """Execute one simulation step with current control state."""
+        if self._episode_is_done():
+            return False
+
         # Build action from current state
         action = np.concatenate([np.zeros_like(self._current_joints), [self._gripper_fraction]])
         # Map gripper: 1.0 (open) -> -1.0, 0.0 (closed) -> 1.0
@@ -275,6 +310,13 @@ class FrankaLiberoEnv(BaseEnv):
 
         if self._record_frames and self._sim_step_count % self._subsample_rate == 0:
             self._record_frame()
+
+        self._record_transition(
+            action=action,
+            source="_step_once",
+            metadata={"gripper_fraction": float(self._gripper_fraction)},
+        )
+        return not self._episode_is_done()
 
     def _get_object_pose(self, obj_name: str) -> tuple[np.ndarray, np.ndarray]:
         """Get the pose of an object in the environment as a position (3,) and WXYZ quaternion (4,).
@@ -408,6 +450,11 @@ class FrankaLiberoEnv(BaseEnv):
     def compute_reward(self) -> float:
         return self._current_reward
 
+    def _episode_is_done(self) -> bool:
+        if self._current_done is not None and bool(self._current_done):
+            return True
+        return bool(self._sim_step_count >= self.max_steps)
+
     def _copy_state_value(self, value: Any) -> Any:
         if isinstance(value, np.ndarray):
             return value.copy()
@@ -481,6 +528,9 @@ class FrankaLiberoEnv(BaseEnv):
         if self._reset_state is None:
             return None
         return self._copy_state_value(self._reset_state)
+
+    def get_transition_dataset(self) -> dict[str, Any] | None:
+        return self._transition_dataset
 
     def get_observation(self) -> dict[str, Any]:
         """Get observation in FrankaLiberoEnv format."""
@@ -577,6 +627,18 @@ class FrankaLiberoEnv(BaseEnv):
         """
         return self._sim_step_count / self._control_freq
 
+    @contextmanager
+    def action_context(self, action_name: str, **metadata: Any):
+        context = {
+            "action_name": action_name,
+            "metadata": self._copy_state_value(metadata),
+        }
+        self._action_context_stack.append(context)
+        try:
+            yield
+        finally:
+            self._action_context_stack.pop()
+
     def task_completed(self) -> bool:
         """Compute if the task is completed."""
         return self.handle.env.check_success()
@@ -660,6 +722,63 @@ class FrankaLiberoEnv(BaseEnv):
             depth=False,
         )
         return frame[::-1]
+
+    def _current_action_context(self) -> dict[str, Any] | None:
+        if not self._action_context_stack:
+            return None
+        return self._copy_state_value(self._action_context_stack[-1])
+
+    def _build_transition_observation(self) -> dict[str, Any]:
+        gripper_robot_base = (
+            vtf.SE3(wxyz_xyz=self.base_link_wxyz_xyz).inverse()
+            @ vtf.SE3(wxyz_xyz=self.gripper_link_wxyz_xyz)
+            @ vtf.SE3.from_rotation_and_translation(
+                rotation=vtf.SO3.from_rpy_radians(0.0, 0.0, np.pi / 2.0),
+                translation=np.array([0, 0, -0.107]),
+            )
+        )
+        robot_joint_pos = np.concatenate(
+            [
+                self._current_obs["robot0_joint_pos"],
+                [self._current_obs["robot0_gripper_qpos"][0] / self.gripper_metric_length],
+            ]
+        )
+        robot_cartesian_pos = np.concatenate(
+            [
+                gripper_robot_base.translation(),
+                gripper_robot_base.rotation().wxyz,
+                [self._current_obs["robot0_gripper_qpos"][0] / self.gripper_metric_length],
+            ]
+        )
+        return {
+            "low_level_observation": self._copy_state_value(self._current_obs),
+            "robot_joint_pos": robot_joint_pos.copy(),
+            "robot_cartesian_pos": robot_cartesian_pos.copy(),
+        }
+
+    def _record_transition(
+        self,
+        *,
+        action: np.ndarray,
+        source: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        if self._transition_dataset is None or self._current_obs is None:
+            return
+        append_transition(
+            self._transition_dataset,
+            timestamp_s=self.get_current_time_s(),
+            wall_time_s=time.time(),
+            sim_step_count=int(self._sim_step_count),
+            action=np.asarray(action, dtype=np.float64).copy(),
+            observation=self._build_transition_observation(),
+            reward=float(self._current_reward) if self._current_reward is not None else None,
+            done=bool(self._current_done) if self._current_done is not None else None,
+            truncated=bool(self._sim_step_count >= self.max_steps),
+            source=source,
+            action_context=self._current_action_context(),
+            metadata=metadata,
+        )
 
     # Viser debugging
     def _update_viser_server(self) -> None:

@@ -111,14 +111,16 @@ def open_gripper(env, steps: int = 30) -> None:
     """Open gripper fully with stepping."""
     env._set_gripper(1.0)
     for _ in range(steps):
-        env._step_once()
+        if env._step_once() is False:
+            break
 
 
 def close_gripper(env, steps: int = 30) -> None:
     """Close gripper fully with stepping."""
     env._set_gripper(0.0)
     for _ in range(steps):
-        env._step_once()
+        if env._step_once() is False:
+            break
 
 
 def open_gripper_arm1(env, steps: int = 30) -> None:
@@ -127,7 +129,8 @@ def open_gripper_arm1(env, steps: int = 30) -> None:
         raise RuntimeError("Environment does not support Arm 1 control")
     env._set_gripper_arm1(1.0)
     for _ in range(steps):
-        env._step_once()
+        if env._step_once() is False:
+            break
 
 
 def close_gripper_arm1(env, steps: int = 30) -> None:
@@ -136,7 +139,8 @@ def close_gripper_arm1(env, steps: int = 30) -> None:
         raise RuntimeError("Environment does not support Arm 1 control")
     env._set_gripper_arm1(0.0)
     for _ in range(steps):
-        env._step_once()
+        if env._step_once() is False:
+            break
 
 
 # ---------------------------------------------------------------------------

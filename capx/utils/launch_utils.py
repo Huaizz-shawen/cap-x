@@ -23,6 +23,7 @@ from PIL import Image
 from capx.envs.configs.instantiate import instantiate
 from capx.envs.configs.loader import DictLoader
 from capx.envs.trajectory_buffer import save_trajectory_artifacts
+from capx.envs.transition_dataset import save_transition_dataset
 
 # Re-export LLM client symbols for backward compatibility
 from capx.llm.client import (  # noqa: F401
@@ -397,6 +398,7 @@ def _save_trial_artifacts(
     ensemble_data: dict[str, str] | None = None,
     multiturn_ensemble_data: list[dict[str, str]] | None = None,
     trajectory_data: dict[str, Any] | None = None,
+    transition_dataset: dict[str, Any] | None = None,
 ) -> str | None:
     """Save trial artifacts (code, logs, images) to the output directory.
 
@@ -470,6 +472,8 @@ def _save_trial_artifacts(
 
     if trajectory_data is not None:
         save_trajectory_artifacts(trial_dir, trajectory_data)
+    if transition_dataset is not None:
+        save_transition_dataset(trial_dir, transition_dataset)
 
     return code_path
 
