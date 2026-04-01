@@ -3,7 +3,9 @@ from __future__ import annotations
 import copy
 import gzip
 import json
+import os
 import pickle
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -34,17 +36,51 @@ def _copy_value(value: Any) -> Any:
     return copy.deepcopy(value)
 
 
+def _atomic_write_bytes(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path_str = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    tmp_path = Path(tmp_path_str)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
+def _atomic_write_gzip_pickle(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path_str = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    tmp_path = Path(tmp_path_str)
+    try:
+        with os.fdopen(fd, "wb") as raw_handle:
+            with gzip.GzipFile(fileobj=raw_handle, mode="wb") as gz_handle:
+                pickle.dump(value, gz_handle, protocol=pickle.HIGHEST_PROTOCOL)
+            raw_handle.flush()
+            os.fsync(raw_handle.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
 def create_transition_dataset(
     *,
     trial: int,
+    attempt: int | None = None,
     config_path: str | None = None,
     task_prompt: str | None = None,
 ) -> dict[str, Any]:
     return {
         "version": 1,
         "trial": trial,
+        "attempt": attempt,
         "config_path": config_path,
         "task_prompt": task_prompt,
+        "trial_metadata": {},
         "initial_observation": None,
         "transitions": [],
     }
@@ -92,19 +128,20 @@ def save_transition_dataset(trial_dir: Path, transition_dataset: dict[str, Any])
     dataset_dir.mkdir(parents=True, exist_ok=True)
 
     payload_path = dataset_dir / "data.pkl.gz"
-    with gzip.open(payload_path, "wb") as handle:
-        pickle.dump(transition_dataset, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    _atomic_write_gzip_pickle(payload_path, transition_dataset)
 
     metadata = {
         "version": transition_dataset.get("version", 1),
         "trial": transition_dataset.get("trial"),
+        "attempt": transition_dataset.get("attempt"),
         "config_path": transition_dataset.get("config_path"),
         "task_prompt": transition_dataset.get("task_prompt"),
+        "trial_metadata": _jsonify(transition_dataset.get("trial_metadata", {})),
         "transition_count": len(transition_dataset.get("transitions", [])),
         "has_initial_observation": transition_dataset.get("initial_observation") is not None,
         "payload_file": payload_path.name,
     }
-    (dataset_dir / "metadata.json").write_text(
-        json.dumps(_jsonify(metadata), indent=2),
-        encoding="utf-8",
+    _atomic_write_bytes(
+        dataset_dir / "metadata.json",
+        json.dumps(_jsonify(metadata), indent=2).encode("utf-8"),
     )

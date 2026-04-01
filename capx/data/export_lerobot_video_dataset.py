@@ -281,10 +281,32 @@ class EpisodeRecord:
     task: str
     source_trial_dir: str
     source_metadata: dict[str, Any]
+    attempt: int | None
     task_completed: bool
     success: bool
+    excluded_from_training: bool
+    exclusion_reason: str | None
     rows: list[dict[str, Any]]
     frames: dict[str, list[np.ndarray]]
+
+
+def _exclude_from_training(
+    transition_dataset: dict[str, Any],
+    trajectory_metadata: dict[str, Any],
+) -> tuple[bool, str | None]:
+    trial_metadata = transition_dataset.get("trial_metadata")
+    if isinstance(trial_metadata, dict):
+        if trial_metadata.get("exclude_from_training"):
+            return True, str(trial_metadata.get("exclusion_reason") or "unknown")
+        return False, None
+
+    trial_complete = next(
+        (event for event in trajectory_metadata.get("events", []) if event.get("event_type") == "trial_complete"),
+        {},
+    )
+    if bool(trial_complete.get("truncated")):
+        return True, "sim_limit_reset"
+    return False, None
 
 
 def _resolve_config_path(config_path: str | None, source_trial_dir: Path) -> Path | None:
@@ -479,14 +501,25 @@ def _build_episode_record(
         for camera_key, frames in frames_by_camera.items()
         if len(frames) == len(rows)
     }
+    excluded_from_training, exclusion_reason = _exclude_from_training(
+        transition_dataset,
+        trajectory_summary,
+    )
+    trial_complete = next(
+        (event for event in trajectory_summary.get("events", []) if event.get("event_type") == "trial_complete"),
+        {},
+    )
     return EpisodeRecord(
         episode_index=episode_index,
         task_index=-1,
         task=task,
         source_trial_dir=str(source_trial_dir.resolve()),
         source_metadata=_infer_source_metadata(transition_dataset, source_trial_dir),
-        task_completed=bool(trajectory_summary.get("task_completed", False)),
-        success=bool(trajectory_summary.get("success", False)),
+        attempt=transition_dataset.get("attempt"),
+        task_completed=bool(trial_complete.get("task_completed", False)),
+        success=bool(trial_complete.get("success", False)),
+        excluded_from_training=excluded_from_training,
+        exclusion_reason=exclusion_reason,
         rows=rows,
         frames=available_cameras,
     )
@@ -518,6 +551,7 @@ def export_lerobot_dataset(
     fps: int | None,
     chunk_size: int,
     crf: int,
+    include_excluded: bool = False,
 ) -> dict[str, Any]:
     transition_paths = sorted(input_root.glob("**/transition_dataset/data.pkl.gz"))
     if not transition_paths:
@@ -537,18 +571,16 @@ def export_lerobot_dataset(
     ):
         trial_dir = transition_path.parent.parent
         trajectory_meta = trial_summaries.get(trial_dir, {})
-        trial_complete = next(
-            (event for event in trajectory_meta.get("events", []) if event.get("event_type") == "trial_complete"),
-            {},
-        )
         episode_records.append(
             _build_episode_record(
                 episode_index=episode_index,
                 transition_dataset=transition_dataset,
-                trajectory_summary=trial_complete,
+                trajectory_summary=trajectory_meta,
                 source_trial_dir=trial_dir,
             )
         )
+    if not include_excluded:
+        episode_records = [episode for episode in episode_records if not episode.excluded_from_training]
 
     task_to_index: dict[tuple[str, tuple[tuple[str, Any], ...]], int] = {}
     task_records_by_index: dict[int, dict[str, Any]] = {}
@@ -649,9 +681,12 @@ def export_lerobot_dataset(
                 "data/chunk_index": int(chunk_index),
                 "data/file_index": int(file_index),
                 "source_trial_dir": episode.source_trial_dir,
+                "attempt": None if episode.attempt is None else int(episode.attempt),
                 **episode.source_metadata,
                 "task_completed": bool(episode.task_completed),
                 "success": bool(episode.success),
+                "excluded_from_training": bool(episode.excluded_from_training),
+                "exclusion_reason": episode.exclusion_reason,
             }
             for camera_key, frames in episode.frames.items():
                 if not frames:
@@ -771,6 +806,7 @@ def export_lerobot_dataset(
         "data_files_size_in_mb": data_size_mb,
         "video_files_size_in_mb": video_size_mb,
         "fps": dataset_fps,
+        "include_excluded": include_excluded,
         "splits": {"train": f"0:{len(episode_records)}"},
         "data_path": "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet",
         "video_path": "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"
@@ -791,6 +827,7 @@ def export_lerobot_dataset(
         "output_root": str(output_root.resolve()),
         "robot_type": robot_type,
         "fps": dataset_fps,
+        "include_excluded": include_excluded,
         "num_episodes": len(episode_records),
         "num_tasks": len(task_to_index),
         "num_frames": total_frames,
@@ -811,6 +848,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fps", type=int, default=None, help="Override FPS. Defaults to inferred from timestamps.")
     parser.add_argument("--chunk-size", type=int, default=1000, help="Episodes per data/video shard.")
     parser.add_argument("--crf", type=int, default=28, help="H.264 CRF. Higher is smaller and lower quality.")
+    parser.add_argument("--include-excluded", action="store_true", help="Include episodes marked as unsuitable for training.")
     return parser
 
 
@@ -824,6 +862,7 @@ def main() -> None:
         fps=args.fps,
         chunk_size=args.chunk_size,
         crf=args.crf,
+        include_excluded=args.include_excluded,
     )
     print(json.dumps(_jsonify(manifest), indent=2))
 

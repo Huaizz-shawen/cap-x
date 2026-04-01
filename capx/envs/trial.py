@@ -119,21 +119,17 @@ def _build_log_lines(
 def _trial_video_dir(
     config: dict[str, Any],
     trial: int,
-    info_step: dict[str, Any],
-    reward: float,
+    attempt_idx: int,
 ) -> str:
     """Return the trial output directory path used for video saving."""
-    return os.path.join(
-        config["output_dir"],
-        f"trial_{trial:02d}_sandboxrc_{info_step['sandbox_rc']}_reward_{reward:.3f}"
-        f"_taskcompleted_{int(info_step.get('task_completed', False))}",
-    )
+    return os.path.join(config["output_dir"], f"trial_{trial:02d}", f"attempt_{attempt_idx:02d}")
 
 
 def _save_trial_video(
     env: CodeExecutionEnvBase,
     config: dict[str, Any],
     trial: int,
+    attempt_idx: int,
     info_step: dict[str, Any],
     reward: float,
     num_code_blocks: int,
@@ -147,7 +143,7 @@ def _save_trial_video(
     if not frames or not config["output_dir"]:
         return
 
-    base_dir = _trial_video_dir(config, trial, info_step, reward)
+    base_dir = _trial_video_dir(config, trial, attempt_idx)
     suffix = f"{reward:.3f}"
     if suffix_extra:
         suffix += f"_{suffix_extra}"
@@ -163,6 +159,7 @@ def _save_turn_and_combined_videos(
     env: CodeExecutionEnvBase,
     config: dict[str, Any],
     trial: int,
+    attempt_idx: int,
     info_step: dict[str, Any],
     reward: float,
     turn_frame_ranges: list[tuple[int, int]],
@@ -183,7 +180,7 @@ def _save_turn_and_combined_videos(
     if not all_frames:
         return
 
-    base_dir = _trial_video_dir(config, trial, info_step, reward)
+    base_dir = _trial_video_dir(config, trial, attempt_idx)
 
     # all_frames may be a list (Robosuite) or a dict of lists (R1Pro multi-camera).
     # Normalise to a list for slicing; dict case is handled by _write_multi_video.
@@ -819,6 +816,7 @@ def _handle_multi_turn_step(
 def _run_single_trial(
     env: CodeExecutionEnvBase,
     trial: int,
+    attempt_idx: int,
     args: LaunchArgs,
     config: dict[str, Any],
     multi_turn_prompt: str | None,
@@ -901,12 +899,14 @@ def _run_single_trial(
 
     trajectory_data = create_trajectory_buffer(
         trial=trial,
+        attempt=attempt_idx,
         config_path=args.config_path,
         task_prompt=obs["full_prompt"][-1]["content"][0]["text"],
     )
     transition_dataset = env.get_transition_dataset() if hasattr(env, "get_transition_dataset") else None
     if transition_dataset is not None:
         transition_dataset["trial"] = trial
+        transition_dataset["attempt"] = attempt_idx
         transition_dataset["config_path"] = args.config_path
         transition_dataset["task_prompt"] = obs["full_prompt"][-1]["content"][0]["text"]
     reset_state = env.get_reset_state() if hasattr(env, "get_reset_state") else None
@@ -950,6 +950,7 @@ def _run_single_trial(
     # Initialize partial artifacts for timeout recovery
     if partial_artifacts is not None:
         partial_artifacts.update({
+            "attempt_idx": attempt_idx,
             "raw_code": raw_code,
             "code_blocks": code_blocks,
             "code_block_metadata": code_block_metadata,
@@ -967,6 +968,24 @@ def _run_single_trial(
             "trajectory_data": trajectory_data,
             "transition_dataset": transition_dataset,
         })
+
+    def _build_trial_metadata() -> dict[str, Any]:
+        stderr_value = info_step.get("stderr", "")
+        exclude_from_training = bool(
+            truncated or "executing action in terminated episode" in stderr_value
+        )
+        return {
+            "trial": trial,
+            "attempt": attempt_idx,
+            "sandbox_rc": int(info_step.get("sandbox_rc", 1)),
+            "reward": float(reward),
+            "task_completed": bool(info_step.get("task_completed", False)),
+            "terminated": bool(terminated),
+            "truncated": bool(truncated),
+            "success": bool(info_step.get("sandbox_rc", 1) == 0),
+            "exclude_from_training": exclude_from_training,
+            "exclusion_reason": "sim_limit_reset" if exclude_from_training else None,
+        }
 
     # Parse initial code into blocks
     initial_blocks = _extract_code(raw_code)
@@ -1071,6 +1090,17 @@ def _run_single_trial(
         })
 
         obs = obs_next
+
+        if info_step.get("task_completed", False):
+            append_event(
+                trajectory_data,
+                "task_completed_auto_finish",
+                code_block_idx=current_block_idx,
+                reward=reward,
+                terminated=terminated,
+                truncated=truncated,
+            )
+            break
 
         # Multi-turn decision
         if multi_turn_prompt:
@@ -1336,17 +1366,18 @@ def _run_single_trial(
         # Save intermediate artifacts (code, logs) per code block
         final_code = _annotate_code_blocks(code_blocks, code_block_metadata)
         _save_trial_artifacts(
-            config, trial, info_step["sandbox_rc"], reward,
+            config, trial, attempt_idx, info_step["sandbox_rc"], reward,
             info_step.get("task_completed", False), final_code, raw_code,
             all_responses, ["-" * 100, "Generated program:", final_code],
             visual_feedback_imgs,
+            trial_metadata=_build_trial_metadata(),
         )
 
         # Only save intermediate video if NOT doing per-turn saving
         # (per-turn saving is deferred to after the loop to avoid clearing the buffer)
         if not recording_frames:
             _save_trial_video(
-                env, config, trial, info_step, reward, len(code_blocks),
+                env, config, trial, attempt_idx, info_step, reward, len(code_blocks),
                 suffix_extra=str(len(code_blocks)),
             )
 
@@ -1387,15 +1418,17 @@ def _run_single_trial(
         num_finishes=num_finishes,
         num_code_blocks=num_code_blocks,
     )
+    trial_metadata = _build_trial_metadata()
 
     code_path = _save_trial_artifacts(
-        config, trial, info_step["sandbox_rc"], reward,
+        config, trial, attempt_idx, info_step["sandbox_rc"], reward,
         info_step.get("task_completed", False), final_code, raw_code,
         all_responses, log_lines, visual_feedback_imgs,
         ensemble_data=ensemble_data,
         multiturn_ensemble_data=multiturn_ensemble_data,
         trajectory_data=trajectory_data,
         transition_dataset=transition_dataset,
+        trial_metadata=trial_metadata,
     )
 
     final_summary = TrialSummary(
@@ -1418,10 +1451,10 @@ def _run_single_trial(
     # Save per-turn and combined videos
     if recording_frames and turn_frame_ranges:
         _save_turn_and_combined_videos(
-            env, config, trial, info_step, reward, turn_frame_ranges,
+            env, config, trial, attempt_idx, info_step, reward, turn_frame_ranges,
         )
     else:
-        _save_trial_video(env, config, trial, info_step, reward, num_code_blocks)
+        _save_trial_video(env, config, trial, attempt_idx, info_step, reward, num_code_blocks)
 
     # --- Evolving skill library integration (opt-in) ---
     if config.get("evolve_skill_library", False) and info_step.get("task_completed", False):

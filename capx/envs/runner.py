@@ -92,8 +92,16 @@ def _start_api_servers(
 def _stop_api_servers(server_procs: list) -> None:
     """Terminate API server sub-processes."""
     for proc in server_procs:
+        if proc is None:
+            continue
+        if not proc.is_alive():
+            proc.join(timeout=1.0)
+            continue
         proc.terminate()
         proc.join(timeout=5.0)
+        if proc.is_alive():
+            proc.kill()
+            proc.join(timeout=3.0)
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +215,7 @@ def _run_trial_with_retries(
             return _run_single_trial_with_timeout(
                 env=env,
                 trial=trial,
+                attempt_idx=attempt + 1,
                 args=args,
                 config=config,
                 multi_turn_prompt=multi_turn_prompt,
@@ -275,6 +284,7 @@ def _run_trial_batch(
 def _run_single_trial_with_timeout(
     env: CodeExecutionEnvBase,
     trial: int,
+    attempt_idx: int,
     args,
     config: dict[str, Any],
     multi_turn_prompt: str | None,
@@ -293,9 +303,10 @@ def _run_single_trial_with_timeout(
     previous_handler = signal.signal(signal.SIGALRM, _timeout_handler)
     signal.alarm(timeout_seconds)
     partial_artifacts: dict[str, Any] = {}
+    partial_artifacts["attempt_idx"] = attempt_idx
     try:
         return _run_single_trial(
-            env, trial, args, config, multi_turn_prompt, partial_artifacts=partial_artifacts
+            env, trial, attempt_idx, args, config, multi_turn_prompt, partial_artifacts=partial_artifacts
         )
     except BaseException as exc:
         is_timeout = timed_out or isinstance(exc, TimeoutError)
@@ -355,6 +366,7 @@ def _build_timeout_summary(
 
     trajectory_data = pa.get("trajectory_data")
     transition_dataset = pa.get("transition_dataset")
+    attempt_idx = pa.get("attempt_idx", 1)
     if trajectory_data is not None:
         append_event(
             trajectory_data,
@@ -370,9 +382,25 @@ def _build_timeout_summary(
             num_finishes=num_finishes,
             num_code_blocks=num_code_blocks,
         )
+    stderr_value = info_step.get("stderr", "")
+    exclude_from_training = bool(
+        truncated or "executing action in terminated episode" in stderr_value
+    )
+    trial_metadata = {
+        "trial": trial,
+        "attempt": attempt_idx,
+        "sandbox_rc": 1,
+        "reward": float(reward),
+        "task_completed": bool(info_step.get("task_completed", False)),
+        "terminated": bool(terminated),
+        "truncated": bool(truncated),
+        "success": False,
+        "exclude_from_training": exclude_from_training,
+        "exclusion_reason": "sim_limit_reset" if exclude_from_training else None,
+    }
 
     code_path = _save_trial_artifacts(
-        config, trial,
+        config, trial, attempt_idx,
         sandbox_rc=1,
         reward=reward,
         task_completed=info_step.get("task_completed", False),
@@ -385,6 +413,7 @@ def _build_timeout_summary(
         multiturn_ensemble_data=pa.get("multiturn_ensemble_data", []),
         trajectory_data=trajectory_data,
         transition_dataset=transition_dataset,
+        trial_metadata=trial_metadata,
     )
 
     return TrialSummary(

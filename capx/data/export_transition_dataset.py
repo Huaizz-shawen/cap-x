@@ -28,16 +28,39 @@ def _load_transition_dataset(path: Path) -> dict[str, Any]:
         return pickle.load(handle)
 
 
-def _load_trial_summary(trial_dir: Path) -> dict[str, Any]:
+def _load_trajectory_metadata(trial_dir: Path) -> dict[str, Any]:
     trajectory_path = trial_dir / "trajectory" / "metadata.json"
     if not trajectory_path.exists():
         return {}
-    data = json.loads(trajectory_path.read_text(encoding="utf-8"))
+    return json.loads(trajectory_path.read_text(encoding="utf-8"))
+
+
+def _load_trial_summary(trial_dir: Path) -> dict[str, Any]:
+    data = _load_trajectory_metadata(trial_dir)
     trial_complete = next(
         (event for event in data.get("events", []) if event.get("event_type") == "trial_complete"),
         None,
     )
     return trial_complete or {}
+
+
+def _exclude_from_training(
+    transition_dataset: dict[str, Any],
+    trajectory_metadata: dict[str, Any],
+) -> tuple[bool, str | None]:
+    trial_metadata = transition_dataset.get("trial_metadata")
+    if isinstance(trial_metadata, dict):
+        if trial_metadata.get("exclude_from_training"):
+            return True, str(trial_metadata.get("exclusion_reason") or "unknown")
+        return False, None
+
+    trial_complete = next(
+        (event for event in trajectory_metadata.get("events", []) if event.get("event_type") == "trial_complete"),
+        {},
+    )
+    if bool(trial_complete.get("truncated")):
+        return True, "sim_limit_reset"
+    return False, None
 
 
 def _extract_initial_modalities(
@@ -157,9 +180,17 @@ def export_transition_dataset(
     episode_idx: int,
     include_images: bool,
     include_depth: bool,
+    include_excluded: bool,
 ) -> dict[str, Any]:
     trial_dir = transition_dataset_path.parent.parent
     transition_dataset = _load_transition_dataset(transition_dataset_path)
+    trajectory_metadata = _load_trajectory_metadata(trial_dir)
+    excluded_from_training, exclusion_reason = _exclude_from_training(
+        transition_dataset,
+        trajectory_metadata,
+    )
+    if excluded_from_training and not include_excluded:
+        raise ValueError(f"Excluded from training ({exclusion_reason})")
     arrays, step_metadata = _build_episode_arrays(
         transition_dataset,
         include_images=include_images,
@@ -181,7 +212,10 @@ def export_transition_dataset(
         "source_transition_dataset": str(transition_dataset_path.resolve()),
         "config_path": transition_dataset.get("config_path"),
         "trial": transition_dataset.get("trial"),
+        "attempt": transition_dataset.get("attempt"),
         "task_prompt": transition_dataset.get("task_prompt"),
+        "excluded_from_training": excluded_from_training,
+        "exclusion_reason": exclusion_reason,
         "num_steps": int(arrays["actions"].shape[0]),
         "action_dim": int(arrays["actions"].shape[1]),
         "included_modalities": sorted(arrays.keys()),
@@ -199,6 +233,7 @@ def export_directory(
     output_root: Path,
     include_images: bool,
     include_depth: bool,
+    include_excluded: bool = False,
 ) -> dict[str, Any]:
     transition_paths = sorted(input_root.glob("**/transition_dataset/data.pkl.gz"))
     if not transition_paths:
@@ -211,13 +246,19 @@ def export_directory(
     exported_episodes: list[dict[str, Any]] = []
     with episodes_jsonl_path.open("w", encoding="utf-8") as jsonl_handle:
         for episode_idx, transition_path in enumerate(transition_paths, start=1):
-            episode_metadata = export_transition_dataset(
-                transition_path,
-                output_root=output_root,
-                episode_idx=episode_idx,
-                include_images=include_images,
-                include_depth=include_depth,
-            )
+            try:
+                episode_metadata = export_transition_dataset(
+                    transition_path,
+                    output_root=output_root,
+                    episode_idx=episode_idx,
+                    include_images=include_images,
+                    include_depth=include_depth,
+                    include_excluded=include_excluded,
+                )
+            except ValueError as exc:
+                if "Excluded from training" in str(exc):
+                    continue
+                raise
             exported_episodes.append(episode_metadata)
             jsonl_handle.write(json.dumps(_jsonify(episode_metadata), ensure_ascii=False) + "\n")
 
@@ -228,6 +269,7 @@ def export_directory(
         "num_episodes": len(exported_episodes),
         "include_images": include_images,
         "include_depth": include_depth,
+        "include_excluded": include_excluded,
         "episodes_jsonl": episodes_jsonl_path.name,
     }
     manifest_path.write_text(json.dumps(_jsonify(manifest), indent=2), encoding="utf-8")
@@ -240,6 +282,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-root", required=True, type=Path, help="Directory to write exported episodes.")
     parser.add_argument("--include-images", action="store_true", help="Export RGB image arrays into the episode npz.")
     parser.add_argument("--include-depth", action="store_true", help="Export depth image arrays into the episode npz.")
+    parser.add_argument("--include-excluded", action="store_true", help="Include episodes marked as unsuitable for training.")
     return parser
 
 
@@ -251,6 +294,7 @@ def main() -> None:
         output_root=args.output_root,
         include_images=args.include_images,
         include_depth=args.include_depth,
+        include_excluded=args.include_excluded,
     )
     print(json.dumps(_jsonify(manifest), indent=2))
 

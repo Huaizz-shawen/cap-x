@@ -1,3 +1,4 @@
+import json
 import os
 import re
 from dataclasses import dataclass
@@ -45,15 +46,14 @@ class ExperimentParser:
     The expected directory structure is:
     experiment_root/
         initial_prompt.txt
-        trial_{idx}_sandboxrc_{rc}_reward_{rew}_taskcompleted_{comp}/
-            all_responses.json
+        trial_{idx}/attempt_{yy}/
+            summary.txt
+            trial_metadata.json
             ...
     """
 
-    # Regex to parse the trial directory name
-    # Example: trial_100_sandboxrc_0_reward_0.952_taskcompleted_1
     TRIAL_DIR_PATTERN = re.compile(
-        r"trial_(\d+)_sandboxrc_(\d+)_reward_([-\d\.]+)_taskcompleted_(\d+)"
+        r"trial_(\d+)(?:_sandboxrc_(\d+)_reward_([-\d\.]+)_taskcompleted_(\d+))?"
     )
 
     def __init__(self, experiment_dir: str | Path):
@@ -79,17 +79,33 @@ class ExperimentParser:
             match = self.TRIAL_DIR_PATTERN.match(item.name)
             if match:
                 trial_idx = int(match.group(1))
-                sandbox_rc = int(match.group(2))
-                reward = float(match.group(3))
-                task_completed = bool(int(match.group(4)))
+                attempts = sorted(
+                    [child for child in item.iterdir() if child.is_dir() and child.name.startswith("attempt_")]
+                )
+                if attempts:
+                    attempt_dir = attempts[-1]
+                    metadata_path = attempt_dir / "trial_metadata.json"
+                    if not metadata_path.exists():
+                        continue
+                    metadata = json.loads(metadata_path.read_text())
+                    sandbox_rc = int(metadata.get("sandbox_rc", 1))
+                    reward = float(metadata.get("reward", 0.0))
+                    task_completed = bool(metadata.get("task_completed", False))
+                else:
+                    if match.group(2) is None:
+                        continue
+                    attempt_dir = item
+                    sandbox_rc = int(match.group(2))
+                    reward = float(match.group(3))
+                    task_completed = bool(int(match.group(4)))
 
                 trial_data = TrialData(
-                    trial_folder_path=item.absolute(),
+                    trial_folder_path=attempt_dir.absolute(),
                     sandbox_rc=sandbox_rc,
                     reward=reward,
                     task_completed=task_completed,
                     initial_prompt_txt_path=initial_prompt_path.absolute(),
-                    summary_txt=(item / "summary.txt").absolute(),
+                    summary_txt=(attempt_dir / "summary.txt").absolute(),
                 )
                 results[trial_idx] = trial_data
 

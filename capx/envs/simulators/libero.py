@@ -40,6 +40,7 @@ class FrankaLiberoEnv(BaseEnv):
         control_freq: int = 20,
         viser_debug: bool = False,
     ) -> None:
+        self._post_success_step_budget_default = 240
         super().__init__()
         self.privileged = privileged
         self.max_steps = max_steps
@@ -79,6 +80,8 @@ class FrankaLiberoEnv(BaseEnv):
         self._reset_state: dict[str, Any] | None = None
         self._transition_dataset: dict[str, Any] | None = None
         self._action_context_stack: list[dict[str, Any]] = []
+        self._code_execution_active = False
+        self._post_success_steps_remaining = 0
 
         # Robot link indices for transforms
         self.gripper_metric_length = 0.04
@@ -165,6 +168,8 @@ class FrankaLiberoEnv(BaseEnv):
 
         self._step_count = 0
         self._sim_step_count = 0
+        self._code_execution_active = False
+        self._post_success_steps_remaining = 0
 
         self._current_joints = self.handle.env.sim.data.qpos[:7].copy()
         self.home_joint_position = np.array(libero_obs["robot0_joint_pos"], dtype=np.float64)
@@ -269,6 +274,7 @@ class FrankaLiberoEnv(BaseEnv):
                     "tolerance": tolerance,
                 },
             )
+            self._consume_post_success_step_budget()
 
             steps += 1
 
@@ -316,6 +322,7 @@ class FrankaLiberoEnv(BaseEnv):
             source="_step_once",
             metadata={"gripper_fraction": float(self._gripper_fraction)},
         )
+        self._consume_post_success_step_budget()
         return not self._episode_is_done()
 
     def _get_object_pose(self, obj_name: str) -> tuple[np.ndarray, np.ndarray]:
@@ -451,9 +458,31 @@ class FrankaLiberoEnv(BaseEnv):
         return self._current_reward
 
     def _episode_is_done(self) -> bool:
-        if self._current_done is not None and bool(self._current_done):
+        if (
+            self._current_done is not None
+            and bool(self._current_done)
+            and not self._can_continue_after_success()
+        ):
             return True
         return bool(self._sim_step_count >= self.max_steps)
+
+    def _can_continue_after_success(self) -> bool:
+        return bool(
+            getattr(self, "_code_execution_active", False)
+            and getattr(self, "_post_success_steps_remaining", 0) > 0
+        )
+
+    def _consume_post_success_step_budget(self) -> None:
+        if self._current_done is not None and bool(self._current_done) and self._post_success_steps_remaining > 0:
+            self._post_success_steps_remaining -= 1
+
+    def begin_code_execution(self) -> None:
+        self._code_execution_active = True
+        self._post_success_steps_remaining = self._post_success_step_budget_default
+
+    def end_code_execution(self) -> None:
+        self._code_execution_active = False
+        self._post_success_steps_remaining = 0
 
     def _copy_state_value(self, value: Any) -> Any:
         if isinstance(value, np.ndarray):
@@ -481,6 +510,8 @@ class FrankaLiberoEnv(BaseEnv):
             "home_joint_position": None
             if self.home_joint_position is None
             else self.home_joint_position.copy(),
+            "code_execution_active": bool(self._code_execution_active),
+            "post_success_steps_remaining": int(self._post_success_steps_remaining),
         }
 
     def capture_state(self) -> dict[str, Any]:
@@ -507,6 +538,8 @@ class FrankaLiberoEnv(BaseEnv):
 
         self._step_count = int(state.get("step_count", 0))
         self._sim_step_count = int(state.get("sim_step_count", 0))
+        self._code_execution_active = bool(state.get("code_execution_active", False))
+        self._post_success_steps_remaining = int(state.get("post_success_steps_remaining", 0))
 
         if state.get("home_joint_position") is not None:
             self.home_joint_position = np.asarray(state["home_joint_position"], dtype=np.float64).copy()

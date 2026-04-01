@@ -52,3 +52,4 @@ def test_transition_dataset_save_roundtrip(tmp_path) -> None:
     assert restored["config_path"] == "env_configs/libero/test.yaml"
     assert restored["transitions"][0]["source"] == "move_to_joints_blocking"
     np.testing.assert_allclose(restored["transitions"][0]["action"], [0.1, 0.2, 0.3])
+    assert not list((tmp_path / "transition_dataset").glob("*.tmp"))

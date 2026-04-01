@@ -34,3 +34,25 @@ def test_move_to_joints_blocking_stops_immediately_after_episode_done() -> None:
     env._panda_joint_qpos_addrs = list(range(7))
 
     env.move_to_joints_blocking(np.ones(7, dtype=np.float64))
+
+
+def test_episode_can_continue_during_post_success_code_completion_window() -> None:
+    env = object.__new__(FrankaLiberoEnv)
+    env._current_done = True
+    env._sim_step_count = 12
+    env.max_steps = 4000
+    env._code_execution_active = True
+    env._post_success_steps_remaining = 3
+
+    assert env._episode_is_done() is False
+
+
+def test_episode_stops_after_post_success_budget_is_exhausted() -> None:
+    env = object.__new__(FrankaLiberoEnv)
+    env._current_done = True
+    env._sim_step_count = 12
+    env.max_steps = 4000
+    env._code_execution_active = True
+    env._post_success_steps_remaining = 0
+
+    assert env._episode_is_done() is True

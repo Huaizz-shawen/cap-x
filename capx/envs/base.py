@@ -95,6 +95,14 @@ class BaseEnv(Env):
         """Return low-level transition data captured during the current episode, if available."""
         return None
 
+    def begin_code_execution(self) -> None:
+        """Hook called before a high-level code block starts executing."""
+        return None
+
+    def end_code_execution(self) -> None:
+        """Hook called after a high-level code block finishes executing."""
+        return None
+
 
 # Use user's BaseEnv for low-level envs
 

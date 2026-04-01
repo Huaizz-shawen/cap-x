@@ -266,14 +266,20 @@ class CodeExecutionEnvBase(Env):
         Subclasses can override hooks to customize inputs and helper bindings.
         """
         self._step_count += 1
-        exec_result = self._exec_user_code(action)
+        if hasattr(self.low_level_env, "begin_code_execution"):
+            self.low_level_env.begin_code_execution()
+        try:
+            exec_result = self._exec_user_code(action)
+        finally:
+            if hasattr(self.low_level_env, "end_code_execution"):
+                self.low_level_env.end_code_execution()
         obs = self._get_observation()
         reward = self.compute_reward()
         if hasattr(self.low_level_env, "task_completed"):
             task_completed = self.low_level_env.task_completed()
         else:
             task_completed = None
-        terminated = reward == 1.0
+        terminated = bool(task_completed) if task_completed is not None else reward == 1.0
 
         truncated = getattr(self.low_level_env, "_sim_step_count", 0) >= getattr(
             self.low_level_env, "max_steps", 999999

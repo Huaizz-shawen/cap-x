@@ -120,3 +120,41 @@ uv run python -m capx.serving.vllm_server --model Qwen/Qwen2.5-Coder-7B-Instruct
 Providers live under `capx/serving/providers/` and implement a simple `generate_code` method. Extend to Gemini/Claude/Bedrock by adding new provider classes.
 
 > **Note:** `.openrouterkey` is git-ignored. Never commit API keys to the repository.
+
+## Local API Bash profiles
+
+For non-OpenRouter providers, you can keep local launch snippets under `.capx_api/` and let `launch.py` expand them into normal CLI flags before parsing.
+
+Example local profile:
+
+```bash
+# .capx_api/my_azure.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+printf '%s\n' \
+  --server-url \
+  'https://your-endpoint.example/v1/chat/completions' \
+  --api-key \
+  'your-secret-key' \
+  --model \
+  'azure/openai/gpt-5.1'
+```
+
+Run with:
+
+```bash
+python capx/envs/launch.py \
+  --api-bash-profile my_azure \
+  --config-path env_configs/libero/franka_libero_goal_1.yaml
+```
+
+You can also point at any file directly:
+
+```bash
+python capx/envs/launch.py \
+  --api-bash-file ~/.config/capx/my_provider.sh \
+  --config-path env_configs/libero/franka_libero_goal_1.yaml
+```
+
+The script must print one argument per line. The expanded args are inserted before the rest of your CLI args, so a later manual flag like `--model ...` still overrides the profile.

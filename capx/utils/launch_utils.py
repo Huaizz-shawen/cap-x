@@ -387,6 +387,7 @@ def _get_visual_feedback(
 def _save_trial_artifacts(
     config: dict[str, Any],
     trial: int,
+    attempt_idx: int,
     sandbox_rc: int,
     reward: float,
     task_completed: bool,
@@ -399,6 +400,7 @@ def _save_trial_artifacts(
     multiturn_ensemble_data: list[dict[str, str]] | None = None,
     trajectory_data: dict[str, Any] | None = None,
     transition_dataset: dict[str, Any] | None = None,
+    trial_metadata: dict[str, Any] | None = None,
 ) -> str | None:
     """Save trial artifacts (code, logs, images) to the output directory.
 
@@ -407,10 +409,7 @@ def _save_trial_artifacts(
     """
     if not config["output_dir"]:
         return None
-    trial_dir = (
-        Path(config["output_dir"])
-        / f"trial_{trial:02d}_sandboxrc_{sandbox_rc}_reward_{reward:.3f}_taskcompleted_{int(task_completed)}"
-    )
+    trial_dir = Path(config["output_dir"]) / f"trial_{trial:02d}" / f"attempt_{attempt_idx:02d}"
     trial_dir.mkdir(parents=True, exist_ok=True)
 
     code_path_obj = trial_dir / "code.py"
@@ -422,6 +421,11 @@ def _save_trial_artifacts(
 
     (trial_dir / "all_responses.json").write_text(json.dumps(all_responses, indent=2))
     (trial_dir / "summary.txt").write_text("\n".join(log_lines))
+    if trial_metadata is not None:
+        (trial_dir / "trial_metadata.json").write_text(
+            json.dumps(trial_metadata, indent=2),
+            encoding="utf-8",
+        )
 
     # Save initial ensemble data if provided
     if ensemble_data:
@@ -471,8 +475,11 @@ def _save_trial_artifacts(
         img.save(trial_dir / f"visual_feedback_{i:02d}.png")
 
     if trajectory_data is not None:
+        trajectory_data["trial_metadata"] = trial_metadata or {}
         save_trajectory_artifacts(trial_dir, trajectory_data)
     if transition_dataset is not None:
+        transition_dataset["attempt"] = attempt_idx
+        transition_dataset["trial_metadata"] = trial_metadata or {}
         save_transition_dataset(trial_dir, transition_dataset)
 
     return code_path

@@ -14,15 +14,22 @@ from capx.envs.transition_dataset import append_transition, create_transition_da
 
 
 def test_export_lerobot_dataset_writes_video_dataset(tmp_path) -> None:
-    trial_dir = tmp_path / "trial_01_sandboxrc_0_reward_1.000_taskcompleted_1"
+    trial_dir = tmp_path / "trial_01" / "attempt_01"
     (trial_dir / "transition_dataset").mkdir(parents=True)
     (trial_dir / "trajectory").mkdir(parents=True)
 
     dataset = create_transition_dataset(
         trial=1,
+        attempt=1,
         config_path="env_configs/libero/franka_libero_goal_1_privileged.yaml",
         task_prompt="Goal: put the bowl on the stove",
     )
+    dataset["trial_metadata"] = {
+        "trial": 1,
+        "attempt": 1,
+        "exclude_from_training": False,
+        "exclusion_reason": None,
+    }
     set_initial_observation(
         dataset,
         {
@@ -127,6 +134,8 @@ def test_export_lerobot_dataset_writes_video_dataset(tmp_path) -> None:
     assert episodes_df.iloc[0]["benchmark"] == "libero"
     assert episodes_df.iloc[0]["suite_name"] == "libero_goal"
     assert int(episodes_df.iloc[0]["task_id"]) == 1
+    assert int(episodes_df.iloc[0]["attempt"]) == 1
+    assert bool(episodes_df.iloc[0]["excluded_from_training"]) is False
 
     episodes_jsonl = (output_root / "meta" / "episodes.jsonl").read_text(encoding="utf-8").strip().splitlines()
     assert len(episodes_jsonl) == 1
@@ -146,6 +155,69 @@ def test_export_lerobot_dataset_writes_video_dataset(tmp_path) -> None:
     assert wrist_video.exists()
     assert agentview_video.stat().st_size > 0
     assert wrist_video.stat().st_size > 0
+
+
+def test_export_lerobot_dataset_skips_excluded_episodes_by_default(tmp_path) -> None:
+    trial_dir = tmp_path / "trial_01" / "attempt_02"
+    (trial_dir / "transition_dataset").mkdir(parents=True)
+    (trial_dir / "trajectory").mkdir(parents=True)
+
+    dataset = create_transition_dataset(
+        trial=1,
+        attempt=2,
+        config_path="env_configs/libero/franka_libero_goal_1.yaml",
+        task_prompt="Goal: put the bowl on the stove",
+    )
+    dataset["trial_metadata"] = {
+        "trial": 1,
+        "attempt": 2,
+        "exclude_from_training": True,
+        "exclusion_reason": "sim_limit_reset",
+    }
+    set_initial_observation(
+        dataset,
+        {
+            "robot_joint_pos": np.zeros(8, dtype=np.float32),
+            "robot_cartesian_pos": np.ones(8, dtype=np.float32),
+            "agentview": {"images": {"rgb": np.zeros((2, 2, 3), dtype=np.uint8)}},
+        },
+    )
+    append_transition(
+        dataset,
+        timestamp_s=0.1,
+        wall_time_s=100.0,
+        sim_step_count=1,
+        action=np.arange(8, dtype=np.float32),
+        observation={
+            "robot_joint_pos": np.ones(8, dtype=np.float32),
+            "robot_cartesian_pos": np.full(8, 2.0, dtype=np.float32),
+            "low_level_observation": {"agentview_image": np.full((2, 2, 3), 10, dtype=np.uint8)},
+        },
+        reward=0.0,
+        done=False,
+        truncated=True,
+        source="_step_once",
+        action_context={"action_name": "goto_pose"},
+        metadata={},
+    )
+    with gzip.open(trial_dir / "transition_dataset" / "data.pkl.gz", "wb") as handle:
+        pickle.dump(dataset, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    (trial_dir / "trajectory" / "metadata.json").write_text(
+        json.dumps({"events": [{"event_type": "trial_complete", "truncated": True}]}),
+        encoding="utf-8",
+    )
+
+    output_root = tmp_path / "lerobot_export"
+    manifest = export_lerobot_dataset(
+        input_root=tmp_path,
+        output_root=output_root,
+        robot_type="franka",
+        fps=10,
+        chunk_size=1000,
+        crf=35,
+    )
+
+    assert manifest["num_episodes"] == 0
 
 
 def test_infer_source_metadata_for_behavior1k_config(tmp_path) -> None:

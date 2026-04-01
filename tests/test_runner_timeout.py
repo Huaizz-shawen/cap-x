@@ -20,7 +20,7 @@ def test_timeout_returns_finalized_summary_without_retry(monkeypatch) -> None:
         num_code_blocks=1,
     )
 
-    def _fake_run_single_trial(env, trial, args, config, multi_turn_prompt, partial_artifacts):
+    def _fake_run_single_trial(env, trial, attempt_idx, args, config, multi_turn_prompt, partial_artifacts):
         partial_artifacts["final_summary"] = final_summary
         raise TimeoutError("timed out while writing videos")
 
@@ -29,6 +29,7 @@ def test_timeout_returns_finalized_summary_without_retry(monkeypatch) -> None:
     summary = _run_single_trial_with_timeout(
         env=object(),
         trial=7,
+        attempt_idx=2,
         args=SimpleNamespace(),
         config={"output_dir": None},
         multi_turn_prompt=None,

@@ -13,15 +13,22 @@ from capx.envs.transition_dataset import (
 
 
 def test_export_directory_writes_training_ready_episode(tmp_path) -> None:
-    trial_dir = tmp_path / "trial_01_sandboxrc_0_reward_1.000_taskcompleted_1"
+    trial_dir = tmp_path / "trial_01" / "attempt_01"
     (trial_dir / "transition_dataset").mkdir(parents=True)
     (trial_dir / "trajectory").mkdir(parents=True)
 
     dataset = create_transition_dataset(
         trial=1,
+        attempt=1,
         config_path="env_configs/libero/franka_libero_goal_1_privileged.yaml",
         task_prompt="put the bowl on the stove",
     )
+    dataset["trial_metadata"] = {
+        "trial": 1,
+        "attempt": 1,
+        "exclude_from_training": False,
+        "exclusion_reason": None,
+    }
     set_initial_observation(
         dataset,
         {
@@ -95,3 +102,65 @@ def test_export_directory_writes_training_ready_episode(tmp_path) -> None:
     metadata = json.loads(episode_json.read_text())
     assert metadata["trial_summary"]["task_completed"] is True
     assert metadata["step_metadata"]["action_context_counts"]["goto_pose"] == 1
+    assert metadata["attempt"] == 1
+    assert metadata["excluded_from_training"] is False
+
+
+def test_export_directory_skips_excluded_episodes_by_default(tmp_path) -> None:
+    trial_dir = tmp_path / "trial_01" / "attempt_02"
+    (trial_dir / "transition_dataset").mkdir(parents=True)
+    (trial_dir / "trajectory").mkdir(parents=True)
+
+    dataset = create_transition_dataset(
+        trial=1,
+        attempt=2,
+        config_path="env_configs/libero/franka_libero_goal_1.yaml",
+        task_prompt="put the bowl on the stove",
+    )
+    dataset["trial_metadata"] = {
+        "trial": 1,
+        "attempt": 2,
+        "exclude_from_training": True,
+        "exclusion_reason": "sim_limit_reset",
+    }
+    set_initial_observation(
+        dataset,
+        {
+            "robot_joint_pos": np.zeros(8, dtype=np.float32),
+            "robot_cartesian_pos": np.ones(8, dtype=np.float32),
+        },
+    )
+    append_transition(
+        dataset,
+        timestamp_s=0.1,
+        wall_time_s=100.0,
+        sim_step_count=1,
+        action=np.arange(8, dtype=np.float32),
+        observation={
+            "robot_joint_pos": np.ones(8, dtype=np.float32),
+            "robot_cartesian_pos": np.full(8, 2.0, dtype=np.float32),
+            "low_level_observation": {},
+        },
+        reward=0.0,
+        done=False,
+        truncated=True,
+        source="_step_once",
+        action_context={"action_name": "goto_pose"},
+        metadata={},
+    )
+    with gzip.open(trial_dir / "transition_dataset" / "data.pkl.gz", "wb") as handle:
+        pickle.dump(dataset, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    (trial_dir / "trajectory" / "metadata.json").write_text(
+        json.dumps({"events": [{"event_type": "trial_complete", "truncated": True}]}),
+        encoding="utf-8",
+    )
+
+    output_root = tmp_path / "exported"
+    manifest = export_directory(
+        input_root=tmp_path,
+        output_root=output_root,
+        include_images=False,
+        include_depth=False,
+    )
+
+    assert manifest["num_episodes"] == 0

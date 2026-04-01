@@ -48,6 +48,8 @@ The current recovery stack in simulation supports:
 - rollback to safe snapshots before regeneration
 - optional model-based snapshot selection over a constrained candidate set
 - trajectory, recovery, and rollback metadata saved alongside each trial
+- stable raw output layout under `trial_xx/attempt_yy`, so workflow retries no longer create ambiguous flat directories
+- automatic training exclusion tags for simulator-limit resets such as truncated episodes or post-termination action attempts
 
 This is intended for automated dataset production for downstream policy, VLA, or world-action-model training, not only for benchmark reporting.
 
@@ -61,23 +63,40 @@ This copies all repo-local skills from `./skills` into `~/.codex/skills`.
 
 ### Data Collection Quick Start
 
-The command below runs a small LIBERO privileged collection job, exports the result into LeRobot `dtype=video`, and validates the exported dataset with the official loader:
+The command below runs a non-privileged LIBERO collection job with image differencing enabled, exports the result into LeRobot `dtype=video`, and validates the exported dataset with the official loader. It assumes your provider credentials live in `.capx_api/codex_gemini_vdm.sh`, where Codex is used as the planner and Gemini is used for visual differencing:
 
 ```bash
 source .venv-libero/bin/activate
 python skills/capx-eap-data-collection/scripts/capx_eap_pipeline.py collect-export \
   --repo-root /media/user/B29202FA9202C2B91/cap-x \
-  --config-path env_configs/libero/franka_libero_goal_1_privileged.yaml \
-  --output-dir outputs/gpt-5.3-codex/quickstart_goal1 \
-  --lerobot-output-root outputs/lerobot/quickstart_goal1 \
-  --server-url http://10.11.18.197:8317/v1/chat/completions \
-  --api-key YOUR_KEY \
-  --model gpt-5.3-codex \
-  --total-trials 1 \
+  --api-bash-profile codex_gemini_vdm \
+  --config-path env_configs/libero/franka_libero_goal_1.yaml \
+  --output-dir outputs/codex_key_goal1_10trials_vdm \
+  --lerobot-output-root outputs/lerobot/codex_key_goal1_10trials_vdm \
+  --total-trials 10 \
+  --num-workers 1 \
   --enable-eap-rollback \
   --enable-eap-recovery \
+  --use-img-differencing \
+  --tmux-session libero-goal1-vdm \
   --validate
 ```
+
+The orchestration script now launches with stronger model retry defaults and cleans the configured API service ports before and after the run. If you only need to clear stale ports from a previous task:
+
+```bash
+python skills/capx-eap-data-collection/scripts/capx_eap_pipeline.py cleanup-services \
+  --repo-root /media/user/B29202FA9202C2B91/cap-x \
+  --config-path env_configs/libero/franka_libero_goal_1.yaml
+```
+
+Collection outputs now land under a stable nested layout such as:
+
+- `outputs/gpt-5.3-codex/my_run/trial_01/attempt_01/summary.txt`
+- `outputs/gpt-5.3-codex/my_run/trial_01/attempt_01/trajectory/metadata.json`
+- `outputs/gpt-5.3-codex/my_run/trial_01/attempt_01/transition_dataset/data.pkl.gz`
+
+When exporting to training formats, samples tagged with `exclude_from_training=true` and `exclusion_reason="sim_limit_reset"` are skipped by default. This keeps obviously invalid episodes out of the training set without deleting the raw trial artifacts. The validation step also uses a writable cache under `/tmp/capx_hf_cache`, so it does not depend on `~/.cache/huggingface` being writable.
 
 ---
 

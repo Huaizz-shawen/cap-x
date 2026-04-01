@@ -35,6 +35,8 @@ GPT_MODELS = [
     "azure/openai/gpt-5.1-codex",
 ]
 VLM_MODELS = [
+    "gemini-3-pro",
+    "gemini-3-pro-preview",
     "google/gemini-3.1-pro-preview",
     "google/gemini-3.1-pro",
     "google/gemini-2.5-flash-lite",
@@ -82,6 +84,12 @@ OPENROUTER_MODELS = [
     "openrouter/qwen/qwen3-235b-a22b",
 ]
 OPENROUTER_SERVER_URL = "http://localhost:8110/chat/completions"
+RETRYABLE_STATUS_CODES = {408, 409, 429, 500, 502, 503, 504}
+DEFAULT_REQUEST_TIMEOUT_S = 240.0
+DEFAULT_RETRY_MAX_ATTEMPTS = 12
+DEFAULT_RETRY_MAX_WALLTIME_S = 7200.0
+DEFAULT_RETRY_INITIAL_S = 15.0
+DEFAULT_RETRY_MAX_SLEEP_S = 240.0
 
 # ---------------------------------------------------------------------------
 # Ensemble configuration
@@ -115,6 +123,73 @@ class ModelQueryArgs:
     max_tokens: int = 4096
     reasoning_effort: str = "medium"
     debug: bool = False
+
+
+@dataclass
+class RequestRetryConfig:
+    request_timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S
+    max_attempts: int = DEFAULT_RETRY_MAX_ATTEMPTS
+    max_retry_walltime_s: float = DEFAULT_RETRY_MAX_WALLTIME_S
+    retry_initial_s: float = DEFAULT_RETRY_INITIAL_S
+    retry_max_sleep_s: float = DEFAULT_RETRY_MAX_SLEEP_S
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
+    except ValueError:
+        return default
+    if parsed <= 0:
+        return default
+    return parsed
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    if parsed <= 0:
+        return default
+    return parsed
+
+
+def _load_request_retry_config() -> RequestRetryConfig:
+    return RequestRetryConfig(
+        request_timeout_s=_env_float("CAPX_MODEL_REQUEST_TIMEOUT_S", DEFAULT_REQUEST_TIMEOUT_S),
+        max_attempts=_env_int("CAPX_MODEL_RETRY_MAX_ATTEMPTS", DEFAULT_RETRY_MAX_ATTEMPTS),
+        max_retry_walltime_s=_env_float(
+            "CAPX_MODEL_RETRY_MAX_WALLTIME_S",
+            DEFAULT_RETRY_MAX_WALLTIME_S,
+        ),
+        retry_initial_s=_env_float("CAPX_MODEL_RETRY_INITIAL_S", DEFAULT_RETRY_INITIAL_S),
+        retry_max_sleep_s=_env_float("CAPX_MODEL_RETRY_MAX_SLEEP_S", DEFAULT_RETRY_MAX_SLEEP_S),
+    )
+
+
+def _compute_retry_sleep_seconds(attempt: int, config: RequestRetryConfig) -> float:
+    base = min(config.retry_initial_s * (2 ** max(0, attempt - 1)), config.retry_max_sleep_s)
+    jitter = random.uniform(0.0, min(base * 0.25, 15.0))
+    return min(base + jitter, config.retry_max_sleep_s)
+
+
+def _is_retryable_exception(exc: requests.RequestException) -> bool:
+    retryable = (
+        requests.exceptions.Timeout,
+        requests.exceptions.ConnectionError,
+        requests.exceptions.ChunkedEncodingError,
+    )
+    return isinstance(exc, retryable)
+
+
+def _is_retryable_status_code(status_code: int) -> bool:
+    return status_code in RETRYABLE_STATUS_CODES
 
 
 def collapse_text_image_inputs(messages: list[dict]) -> list[dict]:
@@ -260,23 +335,62 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
     elif os.getenv("OPENAI_API_KEY") is not None and args.model in GPT_MODELS:
         headers["Authorization"] = f"Bearer {os.getenv('OPENAI_API_KEY')}"
     start_time = time.time()
+    retry_config = _load_request_retry_config()
+    response = None
+    last_error: BaseException | None = None
 
-    # keep calling until it works
-    response = requests.post(
-        server_url, headers=headers, data=json.dumps(payload), timeout=200
-    )
-    retry = 1
-    while response.status_code in [404, 500, 502, 503, 504]:
-        sleep_time = 240 + random.uniform(-90, 90)
-        print(f"Retry {retry}. Model query failed with status code {response.status_code}. Retrying in {sleep_time} seconds...")
-        time.sleep(sleep_time)
-        response = requests.post(
-            server_url, headers=headers, data=json.dumps(payload), timeout=200
+    for attempt in range(1, retry_config.max_attempts + 1):
+        try:
+            response = requests.post(
+                server_url,
+                headers=headers,
+                data=json.dumps(payload),
+                timeout=(30, retry_config.request_timeout_s),
+            )
+            if _is_retryable_status_code(response.status_code):
+                last_error = requests.HTTPError(
+                    f"Model query failed with status code {response.status_code}",
+                    response=response,
+                )
+            else:
+                response.raise_for_status()
+                break
+        except requests.RequestException as exc:
+            if not _is_retryable_exception(exc):
+                raise
+            last_error = exc
+
+        elapsed = time.time() - start_time
+        if attempt >= retry_config.max_attempts or elapsed >= retry_config.max_retry_walltime_s:
+            if response is not None and _is_retryable_status_code(response.status_code):
+                response.raise_for_status()
+            if last_error is not None:
+                raise last_error
+            raise RuntimeError("Model query failed after exhausting retries without a recorded error.")
+
+        sleep_time = _compute_retry_sleep_seconds(attempt, retry_config)
+        sleep_time = min(
+            sleep_time,
+            max(0.0, retry_config.max_retry_walltime_s - elapsed),
         )
-        retry += 1
+        if sleep_time <= 0:
+            if last_error is not None:
+                raise last_error
+            raise RuntimeError("Model query exceeded retry wall-clock budget.")
+        print(
+            f"Retry {attempt}. Model query failed: {last_error}. "
+            f"Retrying in {sleep_time:.1f} seconds..."
+        )
+        time.sleep(sleep_time)
+    else:
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Model query failed unexpectedly without producing a response.")
 
     end_time = time.time()
     print(f"Time taken to query model: {end_time - start_time:.2f} seconds")
+    if response is None:
+        raise RuntimeError("Model query finished without a response object.")
     response.raise_for_status()
     body = response.json()
     out = {}

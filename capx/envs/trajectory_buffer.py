@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import pickle
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -21,17 +23,50 @@ def _jsonify(value: Any) -> Any:
     return value
 
 
+def _atomic_write_bytes(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path_str = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    tmp_path = Path(tmp_path_str)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
+def _atomic_write_pickle(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path_str = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    tmp_path = Path(tmp_path_str)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
 def create_trajectory_buffer(
     *,
     trial: int,
+    attempt: int | None = None,
     config_path: str | None = None,
     task_prompt: str | None = None,
 ) -> dict[str, Any]:
     return {
         "version": 1,
         "trial": trial,
+        "attempt": attempt,
         "config_path": config_path,
         "task_prompt": task_prompt,
+        "trial_metadata": {},
         "snapshots": [],
         "events": [],
         "_snapshot_payloads": {},
@@ -112,15 +147,14 @@ def save_trajectory_artifacts(trial_dir: Path, trajectory_data: dict[str, Any]) 
         payload = snapshot_payloads.get(snapshot_id)
         if payload is None:
             continue
-        with open(snapshots_dir / f"{snapshot_id}.pkl", "wb") as handle:
-            pickle.dump(payload, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        _atomic_write_pickle(snapshots_dir / f"{snapshot_id}.pkl", payload)
 
     metadata = {
         key: value
         for key, value in trajectory_data.items()
         if key != "_snapshot_payloads"
     }
-    (trajectory_dir / "metadata.json").write_text(
-        json.dumps(_jsonify(metadata), indent=2),
-        encoding="utf-8",
+    _atomic_write_bytes(
+        trajectory_dir / "metadata.json",
+        json.dumps(_jsonify(metadata), indent=2).encode("utf-8"),
     )

@@ -10,6 +10,9 @@ env/
 .env
 .openrouterkey
 .nvinferencekeys
+.capx_api/*
+!.capx_api/README.md
+!.capx_api/*.sample.sh
 .capx_skills.json
 .pytest_cache/
 .ruff_cache/
