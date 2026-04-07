@@ -78,16 +78,43 @@ python skills/capx-eap-data-collection/scripts/capx_eap_pipeline.py collect-expo
   --enable-eap-rollback \
   --enable-eap-recovery \
   --use-img-differencing \
-  --tmux-session libero-goal1-vdm \
+  --detached \
   --validate
 ```
 
-The orchestration script now launches with stronger model retry defaults and cleans the configured API service ports before and after the run. If you only need to clear stale ports from a previous task:
+The orchestration script now launches with stronger model retry defaults and cleans the configured API service ports before and after the run. For long-running jobs, prefer `--detached` so the run is not tied to the current IDE or terminal session. Detached jobs write logs and pid files under `outputs/detached_logs/` and `outputs/detached_pids/`. `collect-manifest` now launches each task as its own detached child job and resumes unfinished trials per task, so a single `SIGKILL` no longer forces the whole benchmark back to `task_00`. If you only need to clear stale ports from a previous task:
 
 ```bash
 python skills/capx-eap-data-collection/scripts/capx_eap_pipeline.py cleanup-services \
   --repo-root /media/user/B29202FA9202C2B91/cap-x \
   --config-path env_configs/libero/franka_libero_goal_1.yaml
+```
+
+For multi-task collection, keep `launch.py` single-task and let the outer workflow expand a manifest. A built-in preset covers the standard four LIBERO suites (`libero_10`, `libero_object`, `libero_spatial`, `libero_goal`):
+
+```bash
+python skills/capx-eap-data-collection/scripts/capx_eap_pipeline.py write-manifest \
+  --repo-root /media/user/B29202FA9202C2B91/cap-x \
+  --preset libero_standard_4 \
+  --output-path outputs/manifests/libero_standard_4_2trials.yaml \
+  --trials-per-task 2
+```
+
+Then run only the suite you want from that manifest:
+
+```bash
+python skills/capx-eap-data-collection/scripts/capx_eap_pipeline.py collect-manifest \
+  --repo-root /media/user/B29202FA9202C2B91/cap-x \
+  --api-bash-profile codex_gemini_vdm \
+  --manifest-path outputs/manifests/libero_standard_4_2trials.yaml \
+  --output-root outputs/libero_standard_4_spatial_10x2 \
+  --suite-filter libero_spatial \
+  --trials-per-task 2 \
+  --num-workers 1 \
+  --enable-eap-rollback \
+  --enable-eap-recovery \
+  --use-img-differencing \
+  --detached
 ```
 
 Collection outputs now land under a stable nested layout such as:

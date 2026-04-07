@@ -74,3 +74,30 @@ def test_query_model_retries_on_503(monkeypatch):
 
     assert out["content"] == "done"
     assert sleeps == [2.0]
+
+
+def test_query_model_retries_on_525(monkeypatch):
+    responses = [
+        _FakeResponse(525, {"error": "ssl handshake failed"}),
+        _FakeResponse(200, {"choices": [{"message": {"content": "recovered", "reasoning": None}}]}),
+    ]
+    sleeps: list[float] = []
+
+    def _fake_post(*args, **kwargs):
+        return responses.pop(0)
+
+    monkeypatch.setattr("capx.llm.client.requests.post", _fake_post)
+    monkeypatch.setattr("capx.llm.client.time.sleep", sleeps.append)
+    monkeypatch.setattr("capx.llm.client.random.uniform", lambda a, b: 0.0)
+    monkeypatch.setenv("CAPX_MODEL_RETRY_MAX_ATTEMPTS", "3")
+    monkeypatch.setenv("CAPX_MODEL_RETRY_INITIAL_S", "2")
+    monkeypatch.setenv("CAPX_MODEL_RETRY_MAX_SLEEP_S", "4")
+    monkeypatch.setenv("CAPX_MODEL_RETRY_MAX_WALLTIME_S", "30")
+
+    out = query_model(
+        ModelQueryArgs(model="gemini-3-pro-preview", server_url="http://example.test/v1/chat/completions"),
+        [{"role": "user", "content": "hello"}],
+    )
+
+    assert out["content"] == "recovered"
+    assert sleeps == [2.0]

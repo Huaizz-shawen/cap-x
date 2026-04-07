@@ -319,6 +319,22 @@ def _run_web_ui(args: LaunchArgs, config: dict[str, Any]) -> None:
     uvicorn.run(app, host="0.0.0.0", port=port)
 
 
+def _configure_object_reranker_env(args: LaunchArgs) -> None:
+    """Expose the active VDM config to perception helpers as a mask reranker."""
+    if args.visual_differencing_model:
+        os.environ.setdefault("CAPX_OBJECT_RERANK_MODEL", args.visual_differencing_model)
+    if args.visual_differencing_model_server_url:
+        os.environ.setdefault(
+            "CAPX_OBJECT_RERANK_SERVER_URL",
+            args.visual_differencing_model_server_url,
+        )
+    if args.visual_differencing_model_api_key:
+        os.environ.setdefault(
+            "CAPX_OBJECT_RERANK_API_KEY",
+            args.visual_differencing_model_api_key,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -328,6 +344,7 @@ def main(args: LaunchArgs) -> None:
     from capx.envs.runner import _run_headless_trials, _start_api_servers, _stop_api_servers
 
     start_time = time.time()
+    _configure_object_reranker_env(args)
     env_factory, config, api_servers = _load_config(args)
     server_procs = _start_api_servers(api_servers)
 

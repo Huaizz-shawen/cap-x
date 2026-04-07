@@ -36,7 +36,8 @@ Use non-privileged configs only after the visual service stack is ready. This ma
 - Prefer `--api-bash-profile <name>` if the repo stores provider credentials under `.capx_api/`
 - Make sure the profile configures both the main planner and `--visual-differencing-model-server-url` / `--visual-differencing-model-api-key`, otherwise image differencing will still try `127.0.0.1:8110`.
 - Use `codex_gemini_vdm` when you want Codex as the planner and Gemini as the visual differencing model.
-- Prefer `--tmux-session <name>` for any multi-hour run so the workflow survives terminal disconnects.
+- Prefer `--detached` for any multi-hour run so the workflow survives IDE or terminal crashes. Use `--tmux-session <name>` only when you need interactive inspection.
+- `collect-manifest` now launches one detached child job per task and, on rerun, resumes from the first missing trial for that task instead of starting the whole suite over.
 - The pipeline script now applies stronger default model retry settings via environment variables and automatically cleans API service ports defined in the YAML before and after the run.
 
 Example:
@@ -52,8 +53,41 @@ python skills/capx-eap-data-collection/scripts/capx_eap_pipeline.py collect \
   --enable-eap-rollback \
   --enable-eap-recovery \
   --use-img-differencing \
-  --tmux-session libero-goal1-vdm
+  --detached
 ```
+
+### Multi-Task Manifest Collection
+
+Keep `launch.py` single-task and let the outer workflow expand a manifest into many single-task jobs.
+
+Generate the standard four-suite LIBERO manifest:
+
+```bash
+python skills/capx-eap-data-collection/scripts/capx_eap_pipeline.py write-manifest \
+  --repo-root /media/user/B29202FA9202C2B91/cap-x \
+  --preset libero_standard_4 \
+  --output-path outputs/manifests/libero_standard_4_2trials.yaml \
+  --trials-per-task 2
+```
+
+Run only `libero_spatial` from that manifest:
+
+```bash
+python skills/capx-eap-data-collection/scripts/capx_eap_pipeline.py collect-manifest \
+  --repo-root /media/user/B29202FA9202C2B91/cap-x \
+  --api-bash-profile codex_gemini_vdm \
+  --manifest-path outputs/manifests/libero_standard_4_2trials.yaml \
+  --output-root outputs/libero_standard_4_spatial_10x2 \
+  --suite-filter libero_spatial \
+  --trials-per-task 2 \
+  --num-workers 1 \
+  --enable-eap-rollback \
+  --enable-eap-recovery \
+  --use-img-differencing \
+  --detached
+```
+
+The repository also includes a checked-in preset template at `skills/capx-eap-data-collection/manifests/libero_standard_4.yaml`.
 
 If ports are stuck from a previous run:
 
@@ -62,6 +96,13 @@ python skills/capx-eap-data-collection/scripts/capx_eap_pipeline.py cleanup-serv
   --repo-root /media/user/B29202FA9202C2B91/cap-x \
   --config-path env_configs/libero/franka_libero_goal_1.yaml
 ```
+
+Detached runs write a log and pid file under:
+
+- `outputs/detached_logs/<job>.log`
+- `outputs/detached_pids/<job>.pid`
+
+You can override those paths with `--detached-log-file` and `--detached-pid-file`, and replace a stale detached job with `--detached-replace-existing`.
 
 ## Output Conventions
 

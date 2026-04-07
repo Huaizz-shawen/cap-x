@@ -19,6 +19,7 @@ import io
 import json
 import os
 import re
+import signal
 import time
 from typing import Any
 
@@ -60,6 +61,7 @@ if TYPE_CHECKING:
 
 
 MULTITURN_LIMIT = 10
+PRE_CODEGEN_TIMEOUT_SECONDS = 300
 
 # ---------------------------------------------------------------------------
 # Shared formatting helpers
@@ -110,6 +112,40 @@ def _build_log_lines(
         "-" * 100,
     ])
     return lines
+
+
+def _run_with_phase_timeout(
+    trial: int,
+    phase_name: str,
+    timeout_seconds: int,
+    fn,
+):
+    """Run a callable under a shorter SIGALRM budget while preserving the outer trial alarm."""
+    if timeout_seconds <= 0:
+        return fn()
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    outer_remaining = signal.alarm(0)
+    if outer_remaining <= 0:
+        signal.signal(signal.SIGALRM, previous_handler)
+        return fn()
+
+    phase_budget = max(1, min(int(timeout_seconds), int(outer_remaining)))
+
+    def _phase_timeout_handler(signum: int, frame) -> None:  # type: ignore[override]
+        raise TimeoutError(f"Trial {trial} exceeded {phase_name} timeout of {phase_budget} seconds")
+
+    phase_start = time.monotonic()
+    signal.signal(signal.SIGALRM, _phase_timeout_handler)
+    signal.alarm(phase_budget)
+    try:
+        return fn()
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        elapsed = max(0, int(time.monotonic() - phase_start))
+        remaining_total = max(1, int(outer_remaining) - elapsed)
+        signal.alarm(remaining_total)
 
 
 # ---------------------------------------------------------------------------
@@ -892,9 +928,43 @@ def _run_single_trial(
             "Image/video differencing model must be in the list of VLM models"
         )
 
-    # --- 2. Capture initial visual feedback ---
-    visual_feedback_imgs, visual_feedback_base64_history, task_description = (
-        _capture_initial_visual_feedback(env, obs, config, args, visual_differencing_args)
+    if partial_artifacts is not None:
+        partial_artifacts["pre_codegen_phase"] = True
+        partial_artifacts["phase_timeout_name"] = "pre-codegen"
+        partial_artifacts["phase_timeout_seconds"] = PRE_CODEGEN_TIMEOUT_SECONDS
+
+    def _prepare_initial_prompt_state():
+        visual_feedback = _capture_initial_visual_feedback(
+            env, obs, config, args, visual_differencing_args
+        )
+        if config["use_oracle_code"]:
+            generated_raw_code = env.oracle_code
+            with open(os.path.join(config["output_dir"], "oracle_code.py"), "w") as f:
+                f.write(generated_raw_code)
+            generated_reasoning = None
+            generated_ensemble_data = None
+        else:
+            generated_raw_code, generated_reasoning, generated_ensemble_data = _query_initial_code(
+                args, config, obs
+            )
+        return (
+            visual_feedback,
+            generated_raw_code,
+            generated_reasoning,
+            generated_ensemble_data,
+        )
+
+    # --- 2. Capture initial visual feedback and first code generation ---
+    (
+        (visual_feedback_imgs, visual_feedback_base64_history, task_description),
+        raw_code,
+        reasoning,
+        ensemble_data,
+    ) = _run_with_phase_timeout(
+        trial,
+        "pre-codegen",
+        PRE_CODEGEN_TIMEOUT_SECONDS,
+        _prepare_initial_prompt_state,
     )
 
     trajectory_data = create_trajectory_buffer(
@@ -937,18 +1007,11 @@ def _run_single_trial(
                 f"{base64.b64encode(buf.getvalue()).decode('utf-8')}"
             )
 
-    # --- 3. Initial code generation ---
-    if config["use_oracle_code"]:
-        raw_code = env.oracle_code
-        with open(os.path.join(config["output_dir"], "oracle_code.py"), "w") as f:
-            f.write(raw_code)
-        reasoning = None
-        ensemble_data = None
-    else:
-        raw_code, reasoning, ensemble_data = _query_initial_code(args, config, obs)
-
     # Initialize partial artifacts for timeout recovery
     if partial_artifacts is not None:
+        partial_artifacts["pre_codegen_phase"] = False
+        partial_artifacts.pop("phase_timeout_name", None)
+        partial_artifacts.pop("phase_timeout_seconds", None)
         partial_artifacts.update({
             "attempt_idx": attempt_idx,
             "raw_code": raw_code,

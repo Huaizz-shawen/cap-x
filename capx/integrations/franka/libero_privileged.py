@@ -42,6 +42,7 @@ class FrankaLiberoPrivilegedApi(ApiBase):
             "get_object_pose": self.get_object_pose,
             "get_all_object_poses": self.get_all_object_poses,
             "sample_grasp_pose": self.sample_grasp_pose,
+            "place_on_object_center": self.place_on_object_center,
             "goto_pose": self.goto_pose,
             "open_gripper": self.open_gripper,
             "close_gripper": self.close_gripper,
@@ -106,6 +107,56 @@ class FrankaLiberoPrivilegedApi(ApiBase):
         """
         pos, _ = self._env._get_object_pose(object_name)
         return pos, np.array([0, 1, 0, 0])
+
+    def place_on_object_center(
+        self,
+        object_name: str,
+        grasp_quaternion_wxyz: np.ndarray | None = None,
+        hover_height: float = 0.16,
+        release_height: float = 0.015,
+        retreat_height: float = 0.18,
+        settle_steps: int = 30,
+    ) -> None:
+        """Place the grasped object near the center of a known target object.
+
+        This helper is meant for plate-like targets where the success predicate requires the
+        released object to be close to the target center in XY.
+
+        Args:
+            object_name: Name of the placement target.
+            grasp_quaternion_wxyz: Gripper orientation to preserve while carrying the object. If
+                None, uses top-down orientation (0, 0, 1, 0) in wxyz. For bowls and plates, the
+                helper prefers top-down placement and only preserves the provided quaternion if it
+                is already effectively top-down.
+            hover_height: Height above the target center for the pre-place waypoint.
+            release_height: Height above the target center where the gripper opens.
+            retreat_height: Height above the target center for the retreat waypoint.
+            settle_steps: Extra simulator steps to wait after opening the gripper before retreat.
+        """
+        position, _ = self.get_object_pose(object_name)
+        if position is None:
+            raise ValueError(f"Could not estimate placement target center for '{object_name}'")
+
+        pos = np.asarray(position, dtype=np.float64).reshape(3)
+        place_quat = np.array([0.0, 0.0, 1.0, 0.0], dtype=np.float64)
+        if grasp_quaternion_wxyz is not None:
+            grasp_quat = np.asarray(grasp_quaternion_wxyz, dtype=np.float64).reshape(4)
+            if abs(float(grasp_quat[0])) > 0.98:
+                place_quat = grasp_quat
+
+        hover = pos.copy()
+        hover[2] += hover_height
+        release = pos.copy()
+        release[2] += release_height
+        retreat = pos.copy()
+        retreat[2] += retreat_height
+
+        self.goto_pose(hover, place_quat)
+        self.goto_pose(release, place_quat, z_approach=max(0.0, hover_height - release_height))
+        self.open_gripper()
+        for _ in range(max(0, int(settle_steps))):
+            self._env._step_once()
+        self.goto_pose(retreat, place_quat)
 
     def goto_pose(
         self, position: np.ndarray, quaternion_wxyz: np.ndarray, z_approach: float = 0.0

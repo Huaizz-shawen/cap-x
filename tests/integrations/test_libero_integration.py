@@ -9,6 +9,7 @@ from capx.integrations import libero as lib_mod
 class FakeEnv:
     def __init__(self) -> None:
         self._t = 0
+        self.init_kwargs = {}
 
     def reset(self, seed=None, options=None):  # noqa: D401, ARG002
         self._t = 0
@@ -51,8 +52,9 @@ def test_load_libero_task_root_layout(monkeypatch: object, tmp_path) -> None:
     (task_root / "file.bddl").write_text("(:language lang)", encoding="utf-8")
 
     class FakeOffEnv(FakeEnv):
-        def __init__(self, **kwargs):  # noqa: D401, ARG002
+        def __init__(self, **kwargs):  # noqa: D401
             super().__init__()
+            self.init_kwargs = kwargs
 
     libero_pkg = types.ModuleType("libero")
     benchmark_mod = types.ModuleType("libero.benchmark")
@@ -67,6 +69,7 @@ def test_load_libero_task_root_layout(monkeypatch: object, tmp_path) -> None:
     monkeypatch.setitem(sys.modules, "libero.utils", utils_mod)
 
     handle = lib_mod.load_libero_task("libero_10", task_id=0)
+    assert handle.env.init_kwargs["ignore_done"] is True
     obs, info = handle.reset(seed=0)
     assert isinstance(obs, dict)
     obs, rew, done, info = handle.step([0.0] * 7)
@@ -82,8 +85,9 @@ def test_load_libero_task_nested_layout(monkeypatch: object, tmp_path) -> None:
     (task_root / "file.bddl").write_text("(:language nested layout)", encoding="utf-8")
 
     class FakeOffEnv(FakeEnv):
-        def __init__(self, **kwargs):  # noqa: D401, ARG002
+        def __init__(self, **kwargs):  # noqa: D401
             super().__init__()
+            self.init_kwargs = kwargs
 
     libero_pkg = types.ModuleType("libero")
     nested_pkg = types.ModuleType("libero.libero")
@@ -100,5 +104,6 @@ def test_load_libero_task_nested_layout(monkeypatch: object, tmp_path) -> None:
     monkeypatch.setitem(sys.modules, "libero.libero.utils", utils_mod)
 
     handle = lib_mod.load_libero_task("libero_goal", task_id=0)
+    assert handle.env.init_kwargs["ignore_done"] is True
     obs, info = handle.reset(seed=0)
     assert isinstance(obs, dict)

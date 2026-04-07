@@ -1,5 +1,7 @@
+import io
 import pathlib
 import time
+import copy
 from typing import Any
 
 import numpy as np
@@ -14,6 +16,11 @@ from capx.envs.base import (
 from capx.integrations.base_api import ApiBase
 from capx.integrations.vision.graspnet import init_contact_graspnet, init_contact_graspnet_point_clouds
 from capx.integrations.vision.molmo import init_molmo
+from capx.integrations.vision.candidate_rerank import (
+    load_candidate_selection_args_from_env,
+    select_mask_candidate_with_vlm,
+    should_use_vlm_candidate_selection,
+)
 from capx.integrations.vision.sam2 import init_sam2_point_prompt
 from capx.integrations.vision.sam3 import init_sam3, init_sam3_point_prompt
 from capx.utils.camera_utils import obs_get_rgb
@@ -70,12 +77,166 @@ class FrankaLiberoApi(ApiBase):
         self.wrist_camera_name = "robot0_eye_in_hand"
         self.cfg = None
         self._curobo_world_config = None
+        self._candidate_selection_args = load_candidate_selection_args_from_env()
+        self._language_perception_cache: dict[str, dict[str, Any]] = {}
+        self._language_pose_cache: dict[str, dict[str, Any]] = {}
+
+    @staticmethod
+    def _normalize_language_cache_key(text: str) -> str:
+        normalized = text.strip().lower().replace("_", " ")
+        for prefix in ("the ", "a ", "an "):
+            if normalized.startswith(prefix):
+                normalized = normalized[len(prefix):]
+        return " ".join(normalized.split())
+
+    def _language_cache_keys(self, text: str) -> list[str]:
+        normalized = self._normalize_language_cache_key(text)
+        keys = [text, normalized]
+        # Also keep an underscore form because generated code often mixes spaces and underscores.
+        underscore = normalized.replace(" ", "_")
+        if underscore not in keys:
+            keys.append(underscore)
+        return keys
+
+    def _current_sim_step_count(self) -> int:
+        return int(getattr(self._env, "_sim_step_count", 0))
+
+    def _is_likely_static_language_target(self, text: str) -> bool:
+        normalized = self._normalize_language_cache_key(text)
+        static_keywords = (
+            "plate",
+            "ramekin",
+            "stove",
+            "burner",
+            "counter",
+            "countertop",
+            "table",
+            "tray",
+            "sink",
+            "shelf",
+            "cabinet",
+            "drawer",
+            "bin",
+            "basket",
+            "rack",
+        )
+        return any(keyword in normalized for keyword in static_keywords)
+
+    def _select_cached_language_perception(
+        self,
+        text: str,
+        *,
+        dynamic_max_age_steps: int = 80,
+        static_max_age_steps: int = 800,
+    ) -> dict[str, Any] | None:
+        current_step = self._current_sim_step_count()
+        for key in self._language_cache_keys(text):
+            cached = self._language_perception_cache.get(key)
+            if cached is None:
+                continue
+            cached_step = int(cached.get("sim_step_count", -1))
+            age_steps = max(0, current_step - cached_step) if cached_step >= 0 else 0
+            max_age = (
+                static_max_age_steps
+                if self._is_likely_static_language_target(text)
+                else dynamic_max_age_steps
+            )
+            if age_steps > max_age:
+                continue
+            return {
+                "agentview_mask": copy.deepcopy(cached.get("agentview_mask")),
+                "wrist_mask": copy.deepcopy(cached.get("wrist_mask")),
+                "points_3d": np.asarray(cached.get("points_3d", np.empty((0, 3))), dtype=np.float64).copy(),
+                "agentview_points_3d": np.asarray(cached.get("agentview_points_3d", np.empty((0, 3))), dtype=np.float64).copy(),
+                "wrist_points_3d": np.asarray(cached.get("wrist_points_3d", np.empty((0, 3))), dtype=np.float64).copy(),
+                "agentview_score": cached.get("agentview_score"),
+                "wrist_score": cached.get("wrist_score"),
+                "sim_step_count": cached_step,
+            }
+        return None
+
+    def _select_cached_language_pose(
+        self,
+        text: str,
+        *,
+        dynamic_max_age_steps: int = 80,
+        static_max_age_steps: int = 800,
+    ) -> tuple[np.ndarray, np.ndarray | None] | None:
+        current_step = self._current_sim_step_count()
+        for key in self._language_cache_keys(text):
+            cached = self._language_pose_cache.get(key)
+            if cached is None:
+                continue
+            cached_step = int(cached.get("sim_step_count", -1))
+            age_steps = max(0, current_step - cached_step) if cached_step >= 0 else 0
+            max_age = (
+                static_max_age_steps
+                if self._is_likely_static_language_target(text)
+                else dynamic_max_age_steps
+            )
+            if age_steps > max_age:
+                continue
+            pos = cached["position"]
+            quat = cached["quaternion_wxyz"]
+            return (
+                np.asarray(pos, dtype=np.float64).reshape(3).copy(),
+                None if quat is None else np.asarray(quat, dtype=np.float64).reshape(4).copy(),
+            )
+        return None
+
+    def _set_cached_language_perception(self, text: str, result: dict[str, Any]) -> None:
+        cached = {
+            "agentview_mask": copy.deepcopy(result.get("agentview_mask")),
+            "wrist_mask": copy.deepcopy(result.get("wrist_mask")),
+            "points_3d": np.asarray(result.get("points_3d", np.empty((0, 3))), dtype=np.float64).copy(),
+            "agentview_points_3d": np.asarray(result.get("agentview_points_3d", np.empty((0, 3))), dtype=np.float64).copy(),
+            "wrist_points_3d": np.asarray(result.get("wrist_points_3d", np.empty((0, 3))), dtype=np.float64).copy(),
+            "agentview_score": result.get("agentview_score"),
+            "wrist_score": result.get("wrist_score"),
+            "sim_step_count": self._current_sim_step_count(),
+        }
+        for key in self._language_cache_keys(text):
+            self._language_perception_cache[key] = cached
+
+    def _get_cached_language_perception(self, text: str) -> dict[str, Any] | None:
+        return self._select_cached_language_perception(
+            text,
+            dynamic_max_age_steps=10**9,
+            static_max_age_steps=10**9,
+        )
+
+    def _set_cached_language_pose(
+        self,
+        text: str,
+        position: np.ndarray,
+        quaternion_wxyz: np.ndarray | None,
+    ) -> None:
+        pos = np.asarray(position, dtype=np.float64).reshape(3).copy()
+        quat = (
+            np.asarray(quaternion_wxyz, dtype=np.float64).reshape(4).copy()
+            if quaternion_wxyz is not None
+            else None
+        )
+        for key in self._language_cache_keys(text):
+            self._language_pose_cache[key] = {
+                "position": pos,
+                "quaternion_wxyz": quat,
+                "sim_step_count": self._current_sim_step_count(),
+            }
+
+    def _get_cached_language_pose(self, text: str) -> tuple[np.ndarray, np.ndarray | None] | None:
+        return self._select_cached_language_pose(
+            text,
+            dynamic_max_age_steps=10**9,
+            static_max_age_steps=10**9,
+        )
 
     def functions(self) -> dict[str, Any]:
         fns =  {
             "get_observation": self.get_observation,
             "get_object_pose": self.get_object_pose,
             "sample_grasp_pose": self.sample_grasp_pose,
+            "place_on_object_center": self.place_on_object_center,
             "goto_pose": self.goto_pose,
             "open_gripper": self.open_gripper,
             "close_gripper": self.close_gripper,
@@ -303,6 +464,9 @@ class FrankaLiberoApi(ApiBase):
         placement position.
         It is possible that get_object_pose is sometimes unreliable and will return None for both
         position and quaternion.
+        IMPORTANT: If the task describes the target with attributes, state, or spatial relations,
+        pass the full discriminative phrase here instead of dropping details. For example, prefer
+        "the black bowl between the plate and the ramekin" over just "bowl".
 
         Args:
             object_name: The name of the object to get the pose of, in underscore separated lowercase words.
@@ -314,9 +478,27 @@ class FrankaLiberoApi(ApiBase):
         """
         start_time = time.time()
 
-        result = self.get_object_3d_points_and_masks_from_language(
-            object_name, use_multiview=use_multiview
-        )
+        try:
+            result = self.get_object_3d_points_and_masks_from_language(
+                object_name, use_multiview=use_multiview
+            )
+        except Exception as exc:
+            cached = self._select_cached_language_perception(object_name)
+            if cached is not None:
+                print(
+                    f"[get_object_pose] Falling back to cached perception for '{object_name}' "
+                    f"after fresh perception failed: {exc}"
+                )
+                result = cached
+            else:
+                cached_pose = self._select_cached_language_pose(object_name)
+                if cached_pose is None:
+                    raise
+                print(
+                    f"[get_object_pose] Falling back to cached pose for '{object_name}' "
+                    f"after fresh perception failed: {exc}"
+                )
+                return cached_pose
         points_3d = result["points_3d"]
 
         if len(points_3d) == 0:
@@ -339,12 +521,16 @@ class FrankaLiberoApi(ApiBase):
         quaternion_wxyz = vtf.SO3.from_matrix(R).wxyz
 
         print(f"get_object_pose in {time.time() - start_time} seconds")
+        self._set_cached_language_pose(object_name, position, quaternion_wxyz)
         return position, quaternion_wxyz
 
     def sample_grasp_pose(self, object_name: str, use_multiview: bool = True) -> tuple[np.ndarray, np.ndarray]:
         """Sample a grasp pose for an object in the environment from a natural language description.
         Uses multiview point clouds and plan_grasp_from_point_clouds for more reliable grasp planning.
         Do use the grasp sample quaternion from sample_grasp_pose.
+        IMPORTANT: If the task describes the target with attributes, state, or spatial relations,
+        pass the full discriminative phrase here instead of shortening it. For example, prefer
+        "the black bowl between the plate and the ramekin" over just "bowl".
 
         Args:
             object_name: The name of the object to sample a grasp pose for, in underscore separated lowercase words.
@@ -399,6 +585,101 @@ class FrankaLiberoApi(ApiBase):
         print(f"Grasp sample quaternion wxyz for {object_name}: {best_grasp.wxyz_xyz[:4]}")
         return best_grasp.wxyz_xyz[-3:], best_grasp.wxyz_xyz[:4]
 
+    def place_on_object_center(
+        self,
+        object_name: str,
+        grasp_quaternion_wxyz: np.ndarray | None = None,
+        use_multiview: bool = True,
+        hover_height: float = 0.16,
+        release_height: float = 0.015,
+        retreat_height: float = 0.18,
+        settle_steps: int = 30,
+    ) -> None:
+        """Place the currently grasped object near the center of a target receptacle.
+
+        This helper is intended for plate-like placement targets where the success condition is
+        sensitive to XY alignment. It estimates the target object's top-center from its segmented
+        3D points, approaches above the center, descends close to the top surface, opens the
+        gripper, and retreats upward.
+
+        IMPORTANT:
+        - Pass the full discriminative phrase for the target receptacle if the task uses one.
+        - Prefer this helper over manually computing `plate_pos + offset` when the task requires
+          placing an object "on the plate", because LIBERO's success check expects the released
+          object to be close to the receptacle center in XY.
+        - For bowls and other roughly symmetric objects, prefer the helper's default top-down
+          placement orientation. Reusing the tilted grasp orientation can shift the dropped
+          object toward the receptacle edge and fail the XY-center success check.
+
+        Args:
+            object_name: Natural-language description of the placement target.
+            grasp_quaternion_wxyz: Gripper orientation to preserve while carrying the object. If
+                None, uses top-down orientation (0, 0, 1, 0) in wxyz.
+            use_multiview: Whether to use both cameras for target segmentation.
+            hover_height: Height above the estimated target top for the pre-place waypoint.
+            release_height: Height above the estimated target top where the gripper opens.
+            retreat_height: Height above the estimated target top for the retreat waypoint.
+            settle_steps: Extra simulator steps to wait after opening the gripper before retreat.
+        """
+        points_3d = None
+        try:
+            target = self.get_object_3d_points_and_masks_from_language(
+                object_name,
+                use_multiview=use_multiview,
+            )
+            points_3d = np.asarray(target["points_3d"], dtype=np.float64)
+        except Exception as exc:
+            cached = self._get_cached_language_perception(object_name)
+            if cached is not None:
+                print(
+                    f"[place_on_object_center] Falling back to cached perception for '{object_name}' "
+                    f"after fresh perception failed: {exc}"
+                )
+                points_3d = np.asarray(cached["points_3d"], dtype=np.float64)
+            else:
+                cached_pose = self._get_cached_language_pose(object_name)
+                if cached_pose is None:
+                    raise
+                print(
+                    f"[place_on_object_center] Falling back to cached pose for '{object_name}' "
+                    f"after fresh perception failed: {exc}"
+                )
+                center_pos, _ = cached_pose
+                points_3d = np.asarray([center_pos], dtype=np.float64)
+
+        if points_3d is None or len(points_3d) == 0:
+            raise ValueError(f"Could not estimate target center for placement target '{object_name}'")
+
+        raw_points_3d = np.asarray(points_3d, dtype=np.float64).copy()
+        if len(points_3d) >= 8:
+            points_3d, _ = self.filter_noise(points_3d)
+        if len(points_3d) == 0:
+            points_3d = raw_points_3d
+        if len(points_3d) == 0:
+            raise ValueError(f"No valid target points after filtering for placement target '{object_name}'")
+
+        center_xy = np.median(points_3d[:, :2], axis=0)
+        top_z = float(np.quantile(points_3d[:, 2], 0.9))
+
+        # Keep placement top-down by default. Reusing an angled grasp quaternion for bowls tends
+        # to drop the object near the receptacle edge, which often misses LIBERO's tight XY check.
+        place_quat = np.array([0.0, 0.0, 1.0, 0.0], dtype=np.float64)
+        if grasp_quaternion_wxyz is not None:
+            grasp_quat = np.asarray(grasp_quaternion_wxyz, dtype=np.float64).reshape(4)
+            if abs(float(grasp_quat[0])) > 0.98:
+                place_quat = grasp_quat
+
+        hover = np.array([center_xy[0], center_xy[1], top_z + hover_height], dtype=np.float64)
+        release = np.array([center_xy[0], center_xy[1], top_z + release_height], dtype=np.float64)
+        retreat = np.array([center_xy[0], center_xy[1], top_z + retreat_height], dtype=np.float64)
+
+        self.goto_pose(hover, place_quat)
+        self.goto_pose(release, place_quat, z_approach=max(0.0, hover_height - release_height))
+        self.open_gripper()
+        for _ in range(max(0, int(settle_steps))):
+            self._env._step_once()
+        self.goto_pose(retreat, place_quat)
+
     def _segment_object_from_language(
         self, image: Image.Image, object_name: str
     ) -> tuple[np.ndarray, tuple[int, int] | None, list[float] | None]:
@@ -450,6 +731,42 @@ class FrankaLiberoApi(ApiBase):
             point_xy = (int(round(point_coords[0])), int(round(point_coords[1])))
             return mask_bool, point_xy, scores
 
+    def _task_goal(self) -> str:
+        handle = getattr(self._env, "handle", None)
+        task_language = getattr(handle, "task_language", None)
+        if isinstance(task_language, str):
+            return task_language
+        return ""
+
+    def _maybe_rerank_segmentation_candidates(
+        self,
+        image: Image.Image,
+        text_prompt: str,
+        masks: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        if self._candidate_selection_args is None:
+            return None
+        if not should_use_vlm_candidate_selection(text_prompt, masks):
+            return None
+        selected, info = select_mask_candidate_with_vlm(
+            self._candidate_selection_args,
+            image=image,
+            task_goal=self._task_goal(),
+            object_query=text_prompt,
+            candidates=masks,
+        )
+        if selected is not None:
+            print(
+                f"[candidate_rerank] Selected VLM-ranked mask for '{text_prompt}' "
+                f"(index={info.get('selected_index')}, response={info.get('raw_response')!r})"
+            )
+            return selected
+        print(
+            f"[candidate_rerank] Falling back to score-ranked mask for '{text_prompt}' "
+            f"(reason={info.get('reason')}, response={info.get('raw_response')!r})"
+        )
+        return None
+
     def get_oriented_bounding_box_from_3d_points(self, points: np.ndarray) -> dict[str, Any]:
         """Get the oriented bounding box from 3D points.
 
@@ -492,6 +809,9 @@ class FrankaLiberoApi(ApiBase):
         
         Args:
             text_prompt: Text description of the object to segment.
+                Preserve all task-critical modifiers here, including color, state, and
+                spatial relation phrases. If the task says "the black bowl between the plate
+                and the ramekin", do not simplify it to "bowl" before calling this function.
             use_multiview: If True, uses the wrist camera as well as the main camera for segmentation.
             
         Returns:
@@ -532,7 +852,14 @@ class FrankaLiberoApi(ApiBase):
                     f"SAM3 segmentation failed for '{text_prompt}' on {cam_name}. "
                     f"No masks returned from either point or text prompt."
                 )
-            mask_data = max(masks, key=lambda x: x["score"])
+            pil_rgb = Image.fromarray(rgb)
+            mask_data = self._maybe_rerank_segmentation_candidates(
+                pil_rgb,
+                text_prompt,
+                masks,
+            )
+            if mask_data is None:
+                mask_data = max(masks, key=lambda x: x["score"])
             
             mask = mask_data["mask"]
             score = mask_data["score"]
@@ -601,7 +928,7 @@ class FrankaLiberoApi(ApiBase):
                 print(f"Warning: No points found for {text_prompt}")
                 points_3d = np.array([]).reshape(0, 3)
         
-        return {
+        result = {
             "agentview_mask": agent_data["mask"],
             "wrist_mask": wrist_mask,
             "points_3d": np.asarray(points_3d),
@@ -610,6 +937,8 @@ class FrankaLiberoApi(ApiBase):
             "agentview_score": agent_data["score"],
             "wrist_score": wrist_score,
         }
+        self._set_cached_language_perception(text_prompt, result)
+        return result
     
     def goto_home_joint_position(self) -> None:
         """Return the arm to its reset joint configuration with high manipulability"""

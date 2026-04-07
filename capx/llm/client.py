@@ -37,6 +37,7 @@ GPT_MODELS = [
 VLM_MODELS = [
     "gemini-3-pro",
     "gemini-3-pro-preview",
+    "gemini-2.5-flash-lite",
     "google/gemini-3.1-pro-preview",
     "google/gemini-3.1-pro",
     "google/gemini-2.5-flash-lite",
@@ -84,7 +85,7 @@ OPENROUTER_MODELS = [
     "openrouter/qwen/qwen3-235b-a22b",
 ]
 OPENROUTER_SERVER_URL = "http://localhost:8110/chat/completions"
-RETRYABLE_STATUS_CODES = {408, 409, 429, 500, 502, 503, 504}
+RETRYABLE_STATUS_CODES = {408, 409, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526}
 DEFAULT_REQUEST_TIMEOUT_S = 240.0
 DEFAULT_RETRY_MAX_ATTEMPTS = 12
 DEFAULT_RETRY_MAX_WALLTIME_S = 7200.0

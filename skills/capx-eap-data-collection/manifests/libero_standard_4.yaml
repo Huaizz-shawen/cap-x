@@ -1,0 +1,30 @@
+version: 1
+benchmark: libero_standard_4
+description: Standard LIBERO four-suite benchmark manifest for outer-agent orchestration.
+robot_type: franka
+default_trials_per_task: 2
+suites:
+  - suite_name: libero_10
+    num_tasks: 10
+    task_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    trials_per_task: 2
+    base_config_path: env_configs/libero/franka_libero.yaml
+    privileged_base_config_path: env_configs/libero/franka_libero_10_0_privileged.yaml
+  - suite_name: libero_object
+    num_tasks: 10
+    task_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    trials_per_task: 2
+    base_config_path: env_configs/libero/franka_libero_object_0.yaml
+    privileged_base_config_path: env_configs/libero/franka_libero_object_0_privileged.yaml
+  - suite_name: libero_spatial
+    num_tasks: 10
+    task_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    trials_per_task: 2
+    base_config_path: env_configs/libero/franka_libero_spatial_0.yaml
+    privileged_base_config_path: env_configs/libero/franka_libero_spatial_0_privileged.yaml
+  - suite_name: libero_goal
+    num_tasks: 10
+    task_ids: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    trials_per_task: 2
+    base_config_path: env_configs/libero/franka_libero_goal_1.yaml
+    privileged_base_config_path: env_configs/libero/franka_libero_goal_1_privileged.yaml

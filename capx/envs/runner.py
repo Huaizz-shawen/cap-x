@@ -358,10 +358,20 @@ def _build_timeout_summary(
     num_finishes = pa.get("num_finishes", 0)
     num_code_blocks = pa.get("num_code_blocks", len(code_blocks))
 
+    phase_timeout_name = pa.get("phase_timeout_name")
+    phase_timeout_seconds = pa.get("phase_timeout_seconds")
+    if phase_timeout_name and phase_timeout_seconds:
+        prefix = (
+            f"Trial {trial} exceeded {phase_timeout_name} timeout of "
+            f"{int(phase_timeout_seconds)} seconds."
+        )
+    else:
+        prefix = f"Trial {trial} timed out after {timeout_seconds} seconds."
+
     log_lines = _build_log_lines(
         final_code, info_step, reward, terminated, truncated,
         num_regenerations, num_finishes, num_code_blocks,
-        prefix=f"Trial {trial} timed out after {timeout_seconds} seconds.",
+        prefix=prefix,
     )
 
     trajectory_data = pa.get("trajectory_data")
@@ -383,9 +393,17 @@ def _build_timeout_summary(
             num_code_blocks=num_code_blocks,
         )
     stderr_value = info_step.get("stderr", "")
+    is_pre_codegen_timeout = bool(pa.get("pre_codegen_phase")) and num_code_blocks == 0
     exclude_from_training = bool(
-        truncated or "executing action in terminated episode" in stderr_value
+        is_pre_codegen_timeout
+        or truncated
+        or "executing action in terminated episode" in stderr_value
     )
+    exclusion_reason = None
+    if is_pre_codegen_timeout:
+        exclusion_reason = "pre_codegen_timeout"
+    elif exclude_from_training:
+        exclusion_reason = "sim_limit_reset"
     trial_metadata = {
         "trial": trial,
         "attempt": attempt_idx,
@@ -396,7 +414,7 @@ def _build_timeout_summary(
         "truncated": bool(truncated),
         "success": False,
         "exclude_from_training": exclude_from_training,
-        "exclusion_reason": "sim_limit_reset" if exclude_from_training else None,
+        "exclusion_reason": exclusion_reason,
     }
 
     code_path = _save_trial_artifacts(

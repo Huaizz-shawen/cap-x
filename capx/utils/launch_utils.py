@@ -74,7 +74,10 @@ def run_server_proc(api_cfg) -> multiprocessing.Process:
     proc = ctx.Process(
         target=instantiate,  # child will call main(**cfg) via Hydra-style instantiate
         args=(api_cfg,),
-        daemon=True,
+        # Keep API servers explicitly managed by the runner instead of tying their
+        # lifetime to Python's daemon-process semantics. This reduces surprising
+        # shutdowns when the parent process briefly unwinds during retries.
+        daemon=False,
     )
     proc.start()
     return proc
@@ -173,7 +176,7 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
     return env_factory, merged_config, api_servers
 
 
-def _extract_code(content: str) -> list[str]:
+def _extract_code(content: str | None) -> list[str]:
     """Extract Python code from Markdown fenced code block.
 
     Args:
@@ -182,6 +185,10 @@ def _extract_code(content: str) -> list[str]:
     Returns:
         Extracted Python code list
     """
+    if content is None:
+        return [""]
+    if not isinstance(content, str):
+        content = str(content)
     fence_start = "```python\n"
     fence_end = "```"
     start_idx = 0

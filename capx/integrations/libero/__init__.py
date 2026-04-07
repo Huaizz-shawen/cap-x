@@ -177,6 +177,9 @@ def load_libero_task(
         "horizon": horizon,
         "control_freq": control_freq,
         "camera_depths": camera_depths,
+        # Keep stepping after task success so code-defined release / retreat / home
+        # motions can finish without robosuite rejecting post-success actions.
+        "ignore_done": True,
     }
     env = OffScreenRenderEnv(**env_args)
     env.seed(0)

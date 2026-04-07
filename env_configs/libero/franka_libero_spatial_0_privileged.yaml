@@ -19,6 +19,7 @@ env:
     prompt: |
       You are controlling a Franka Emika robot with API described below.
       Goal: {libero_environment_goal}
+      When the goal names an object using attributes, state, or spatial relations, you must preserve that full discriminative phrase in your internal target selection logic. Do not simplify "the black bowl between the plate and the ramekin" to "bowl".
       You may write python code comments for reasoning but ONLY write the executable Python code and do not write it in code fences.
       After this code executes, you will be able to get a new observation of the environment and write new code to complete the task if needed.
       The functions (APIs) below are already imported to the environment. If you want to use numpy, you need to import it explicitly.
