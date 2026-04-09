@@ -175,6 +175,11 @@ def test_manifest_orchestrator_detached_paths_prefers_env(tmp_path, monkeypatch)
     assert resolved_pid_path == pid_path.resolve()
 
 
+def test_read_pid_state_returns_none_for_missing_pid():
+    module = _load_pipeline_module()
+    assert module._read_pid_state(999999999) is None
+
+
 def test_iter_manifest_jobs_supports_suite_filter_and_trial_override():
     module = _load_pipeline_module()
     manifest = module._materialize_manifest_preset("libero_standard_4", trials_per_task=2)
@@ -770,3 +775,49 @@ env:
         }
     ]
     assert result["next_detached_orchestrator"]["detached_pid"] == "3001"
+
+
+def test_wait_for_pid_exit_reaps_zombie_child(monkeypatch):
+    module = _load_pipeline_module()
+    events: list[str] = []
+
+    waitpid_results = iter([(0, 0), (1234, 0)])
+
+    def _fake_waitpid(pid, options):
+        events.append(f"waitpid:{pid}:{options}")
+        return next(waitpid_results)
+
+    monkeypatch.setattr(module.os, "waitpid", _fake_waitpid)
+    monkeypatch.setattr(module, "_read_pid_state", lambda pid: "Z")
+    monkeypatch.setattr(module, "_is_pid_alive", lambda pid: True)
+    monkeypatch.setattr(module.time, "sleep", lambda seconds: events.append(f"sleep:{seconds}"))
+
+    module._wait_for_pid_exit(1234, poll_interval_s=0.1)
+
+    assert events == [
+        "waitpid:1234:1",
+        "waitpid:1234:0",
+    ]
+
+
+def test_summarize_completed_trials_ignores_empty_codegen_attempts(tmp_path):
+    module = _load_pipeline_module()
+    output_dir = tmp_path / "run"
+    attempt_dir = output_dir / "trial_01" / "attempt_01"
+    attempt_dir.mkdir(parents=True, exist_ok=True)
+    (attempt_dir / "trial_metadata.json").write_text(
+        json.dumps(
+            {
+                "trial": 1,
+                "attempt": 1,
+                "task_completed": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (attempt_dir / "code.py").write_text("# Code block 0\n", encoding="utf-8")
+
+    summary = module._summarize_completed_trials(output_dir)
+
+    assert summary["num_completed_trials"] == 0
+    assert summary["completed_trial_ids"] == []

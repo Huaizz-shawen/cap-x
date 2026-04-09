@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 
 GPT_MODELS = [
     "gpt-5",
+    "gpt-5.3-codex",
     "azure/openai/gpt-5.1",
     "gpt-5.1",
     "openai/openai/gpt-5.1-codex",
@@ -37,6 +38,7 @@ GPT_MODELS = [
 VLM_MODELS = [
     "gemini-3-pro",
     "gemini-3-pro-preview",
+    "gemini-3-flash-preview",
     "gemini-2.5-flash-lite",
     "google/gemini-3.1-pro-preview",
     "google/gemini-3.1-pro",
@@ -288,7 +290,8 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
         server_url = args.server_url
 
     if args.model in GPT_MODELS:
-        if "codex" in args.model:
+        use_responses_api = ("codex" in args.model) and ("/v1/responses" in server_url)
+        if use_responses_api:
             prompt = _completions_to_responses_convert_prompt(prompt)
             payload = {
                 "model": args.model,
@@ -398,7 +401,7 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
     if args.debug:
         print(json.dumps(body, indent=2))
     try:
-        if args.model in GPT_MODELS and "codex" in args.model:
+        if args.model in GPT_MODELS and "codex" in args.model and "/v1/responses" in server_url:
             out["content"] = body["output_text"]
         else:
             out["content"] = body["choices"][0]["message"]["content"]
@@ -406,8 +409,59 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
         raise RuntimeError(f"Unexpected response format: {body}") from exc
     if body.get("choices") is not None:
         out["reasoning"] = body.get("choices")[0].get("message").get("reasoning", None)
+        out["finish_reason"] = body.get("choices")[0].get("finish_reason")
     else:
         out["reasoning"] = None
+        out["finish_reason"] = None
+    out["raw_response"] = body
+
+    # Some OpenAI-compatible backends return `content: null` for non-stream chat
+    # responses while still producing valid text deltas in streaming mode.
+    # Fall back to one streaming pass to recover text when possible.
+    if (
+        out.get("content") in (None, "")
+        and body.get("choices") is not None
+        and "/v1/chat/completions" in server_url
+    ):
+        stream_payload = copy.deepcopy(payload)
+        stream_payload["stream"] = True
+        full_content = ""
+        try:
+            with requests.post(
+                server_url,
+                headers=headers,
+                data=json.dumps(stream_payload),
+                timeout=(30, retry_config.request_timeout_s),
+                stream=True,
+            ) as stream_response:
+                stream_response.raise_for_status()
+                for line in stream_response.iter_lines():
+                    if not line:
+                        continue
+                    line_str = line.decode("utf-8")
+                    if not line_str.startswith("data: "):
+                        continue
+                    data_str = line_str[6:]
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        data = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+                    choices = data.get("choices", [])
+                    if not choices:
+                        continue
+                    delta = choices[0].get("delta", {})
+                    delta_content = delta.get("content")
+                    if isinstance(delta_content, str):
+                        full_content += delta_content
+            if full_content:
+                out["content"] = full_content
+                out["stream_fallback_used"] = True
+        except requests.RequestException:
+            # Keep original response; upstream will handle empty-code behavior.
+            pass
+
     return out  # type: ignore[return-value]
 
 

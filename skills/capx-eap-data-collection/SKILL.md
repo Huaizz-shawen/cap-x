@@ -42,6 +42,7 @@ Do not use this skill for editing policy code inside `cap-x` unless the user is 
 - For EAP development, start with LIBERO privileged configs because simulator rewind and rollback are easier to validate there.
 - For non-privileged collection, prefer `--use-img-differencing` so the planner gets visual feedback across turns instead of relying only on stdout/stderr.
 - For long-running collection, prefer `--detached` so the workflow is not tied to the current IDE or terminal session. Use `--tmux-session <name>` only when you explicitly want an interactive multiplexer session.
+- For heavy LIBERO sweeps, default to `--num-workers 1`. Running multiple simulator stacks in parallel can quickly saturate host RAM/CPU and reduce stability.
 - The orchestration script now cleans up configured API service ports before and after collection, so the next run should not inherit stale `8114/8115/8116` listeners.
 - The orchestration script also exports stronger model retry defaults through environment variables, so transient `read timeout` / `503` failures do not immediately kill the workflow.
 - Raw artifacts are now organized as `trial_xx/attempt_yy`, so retries and final outputs stay grouped under one trial instead of producing multiple ambiguous flat directories.
@@ -53,6 +54,7 @@ Do not use this skill for editing policy code inside `cap-x` unless the user is 
 - Validation uses a writable Hugging Face cache under `/tmp/capx_hf_cache` by default, so it should work even when `~/.cache/huggingface` is read-only.
 - For multi-task collection, prefer `write-manifest` plus `collect-manifest` over modifying `launch.py`.
 - `collect-manifest` now orchestrates one detached child collection job per task and resumes unfinished trials on rerun, so long batches are less vulnerable to single-process failures.
+- For detached manifest runs, prefer explicit `--detached-log-file` and `--detached-pid-file` per experiment when you reuse the same manifest name across different output roots.
 
 ## Fast Paths
 
@@ -142,6 +144,8 @@ python skills/capx-eap-data-collection/scripts/capx_eap_pipeline.py collect-mani
   --api-bash-profile codex_gemini_vdm \
   --manifest-path outputs/manifests/libero_standard_4_2trials.yaml \
   --output-root outputs/libero_standard_4_spatial_10x2 \
+  --detached-log-file outputs/detached_logs/libero_standard_4_spatial_10x2.log \
+  --detached-pid-file outputs/detached_pids/libero_standard_4_spatial_10x2.pid \
   --suite-filter libero_spatial \
   --trials-per-task 2 \
   --num-workers 1 \

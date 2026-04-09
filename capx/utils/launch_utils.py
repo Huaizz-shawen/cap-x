@@ -9,6 +9,7 @@ import json
 import logging
 import multiprocessing
 import os
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -205,6 +206,26 @@ def _extract_code(content: str | None) -> list[str]:
     # content_list = content.split("breakpoint_code_block()")
 
     return [content]
+
+
+def _is_effectively_empty_code(code: str | None) -> bool:
+    if code is None:
+        return True
+    if not isinstance(code, str):
+        code = str(code)
+    retained_lines: list[str] = []
+    for line in code.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if re.fullmatch(r"# Code block \d+", stripped):
+            continue
+        retained_lines.append(stripped)
+    return len(retained_lines) == 0
+
+
+def _count_nonempty_code_blocks(code_blocks: list[str]) -> int:
+    return sum(1 for block in code_blocks if not _is_effectively_empty_code(block))
 
 
 def _build_multi_turn_decision_prompt_legacy(
@@ -461,6 +482,38 @@ def _save_trial_artifacts(
             (trial_dir / "prompts_and_responses" / "task_seg_description.txt").write_text(response["task_seg_description"])
         if "task_seg_prompt" in response:
             (trial_dir / "prompts_and_responses" / "task_seg_prompt.txt").write_text(str(response["task_seg_prompt"]))
+        if "initial_scene_prompt" in response:
+            try:
+                (trial_dir / "prompts_and_responses" / "initial_scene_prompt.json").write_text(
+                    json.dumps(response["initial_scene_prompt"], indent=2),
+                    encoding="utf-8",
+                )
+            except Exception as e:
+                print(f"Error saving initial_scene_prompt: {e}")
+        if "initial_scene_raw_response" in response:
+            try:
+                (trial_dir / "prompts_and_responses" / "initial_scene_raw_response.txt").write_text(
+                    str(response["initial_scene_raw_response"]),
+                    encoding="utf-8",
+                )
+            except Exception as e:
+                print(f"Error saving initial_scene_raw_response: {e}")
+        if "initial_scene_reasoning" in response:
+            try:
+                (trial_dir / "prompts_and_responses" / "initial_scene_reasoning.txt").write_text(
+                    str(response["initial_scene_reasoning"]),
+                    encoding="utf-8",
+                )
+            except Exception as e:
+                print(f"Error saving initial_scene_reasoning: {e}")
+        if "initial_scene_task_description" in response:
+            try:
+                (trial_dir / "prompts_and_responses" / "initial_scene_task_description.txt").write_text(
+                    str(response["initial_scene_task_description"]),
+                    encoding="utf-8",
+                )
+            except Exception as e:
+                print(f"Error saving initial_scene_task_description: {e}")
         if "initial_prompt" in response:
             try:
                 initial_prompt_content = response["initial_prompt"][-1]["content"][0]["text"]
@@ -469,6 +522,22 @@ def _save_trial_artifacts(
                 (trial_dir / "prompts_and_responses" / "initial_prompt.txt").write_text(str(initial_prompt_content))
             except Exception as e:
                 print(f"Error saving initial_prompt: {e}")
+        if "initial_model_finish_reason" in response:
+            try:
+                (trial_dir / "prompts_and_responses" / "initial_model_finish_reason.txt").write_text(
+                    str(response["initial_model_finish_reason"]),
+                    encoding="utf-8",
+                )
+            except Exception as e:
+                print(f"Error saving initial_model_finish_reason: {e}")
+        if "initial_model_raw_response" in response and response["initial_model_raw_response"] is not None:
+            try:
+                (trial_dir / "prompts_and_responses" / "initial_model_raw_response.json").write_text(
+                    json.dumps(response["initial_model_raw_response"], indent=2),
+                    encoding="utf-8",
+                )
+            except Exception as e:
+                print(f"Error saving initial_model_raw_response: {e}")
         if "multi_turn_prompt" in response and response["multi_turn_prompt"] is not None:
             try:
                 multi_turn_prompt_content = response["multi_turn_prompt"][-1]["content"][0]["text"]

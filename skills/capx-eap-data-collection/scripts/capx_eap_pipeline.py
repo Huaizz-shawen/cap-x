@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shlex
@@ -14,6 +15,7 @@ import time
 from pathlib import Path
 
 import yaml
+from capx.utils.launch_utils import _count_nonempty_code_blocks
 
 
 DEFAULT_MODEL_REQUEST_TIMEOUT_S = 240.0
@@ -383,6 +385,19 @@ def _summarize_completed_trials(output_dir: Path) -> dict[str, object]:
             trial_id = int(entry.get("trial"))
         except Exception:
             continue
+        nonempty_code_blocks = entry.get("num_nonempty_code_blocks")
+        if nonempty_code_blocks is None:
+            metadata_path = Path(str(entry.get("_path", "")))
+            code_path = metadata_path.parent / "code.py"
+            if code_path.exists():
+                try:
+                    nonempty_code_blocks = _count_nonempty_code_blocks(
+                        [code_path.read_text(encoding="utf-8")]
+                    )
+                except Exception:
+                    nonempty_code_blocks = None
+        if nonempty_code_blocks is not None and int(nonempty_code_blocks) <= 0:
+            continue
         completed_trials.setdefault(trial_id, []).append(entry)
         if bool(entry.get("task_completed", False)):
             successful_trials.add(trial_id)
@@ -517,9 +532,33 @@ def _read_pid_file(pid_path: Path) -> int | None:
         return None
 
 
+def _read_pid_state(pid: int) -> str | None:
+    stat_path = Path(f"/proc/{pid}/stat")
+    try:
+        stat_text = stat_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+    parts = stat_text.split()
+    if len(parts) < 3:
+        return None
+    return parts[2]
+
+
 def _derive_detached_name(args: argparse.Namespace) -> str:
     if getattr(args, "command", None) == "collect-manifest":
-        base = Path(args.manifest_path).stem
+        manifest_stem = Path(args.manifest_path).stem
+        output_root = str(getattr(args, "output_root", ""))
+        suite_filters = ",".join(getattr(args, "suite_filter", []) or [])
+        trials_per_task = str(getattr(args, "trials_per_task", ""))
+        unique_source = (
+            f"collect-manifest|manifest={args.manifest_path}|output_root={output_root}|"
+            f"suite_filter={suite_filters}|trials_per_task={trials_per_task}"
+        )
+        unique_suffix = hashlib.sha1(unique_source.encode("utf-8")).hexdigest()[:10]
+        output_stem = Path(output_root).name if output_root else "output"
+        base = f"{manifest_stem}-{output_stem}-{unique_suffix}"
     elif getattr(args, "output_dir", None):
         base = Path(args.output_dir).name
     elif getattr(args, "output_root", None):
@@ -643,7 +682,26 @@ def _manifest_orchestrator_detached_paths(repo_root: Path, args: argparse.Namesp
 
 
 def _wait_for_pid_exit(pid: int, *, poll_interval_s: float = 5.0) -> None:
-    while _is_pid_alive(pid):
+    while True:
+        try:
+            waited_pid, _ = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            waited_pid = 0
+        if waited_pid == pid:
+            return
+
+        pid_state = _read_pid_state(pid)
+        if pid_state is None:
+            return
+        if pid_state == "Z":
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
+            return
+
+        if not _is_pid_alive(pid):
+            return
         time.sleep(poll_interval_s)
 
 

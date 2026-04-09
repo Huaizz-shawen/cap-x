@@ -21,6 +21,7 @@ import os
 import re
 import signal
 import time
+import traceback
 from typing import Any
 
 import numpy as np
@@ -46,6 +47,7 @@ from capx.utils.launch_utils import (
     TrialSummary,
     _build_multi_turn_decision_prompt,
     _build_multi_turn_decision_prompt_legacy,
+    _count_nonempty_code_blocks,
     _extract_code,
     _get_visual_feedback,
     _parse_multi_turn_decision,
@@ -257,15 +259,16 @@ def _capture_initial_visual_feedback(
     config: dict[str, Any],
     args: LaunchArgs,
     visual_differencing_args: ModelQueryArgs,
-) -> tuple[list, list[str], str]:
+) -> tuple[list, list[str], str, dict[str, Any] | None]:
     """Capture the initial environment image and optionally describe it.
 
     Returns:
-        (visual_feedback_imgs, visual_feedback_base64_history, task_description)
+        (visual_feedback_imgs, visual_feedback_base64_history, task_description, initial_scene_artifact)
     """
     visual_feedback_imgs: list = []
     visual_feedback_base64_history: list[str] = []
     task_description = ""
+    initial_scene_artifact: dict[str, Any] | None = None
 
     use_wrist = config.get("use_wrist_camera", False)
 
@@ -275,7 +278,7 @@ def _capture_initial_visual_feedback(
         or config.get("use_video_differencing", False)
     )
     if not (needs_visual and hasattr(env, "render")):
-        return visual_feedback_imgs, visual_feedback_base64_history, task_description
+        return visual_feedback_imgs, visual_feedback_base64_history, task_description, initial_scene_artifact
 
     initial_base64, initial_img = _get_visual_feedback(env)
     visual_feedback_imgs.append(initial_img)
@@ -317,16 +320,22 @@ def _capture_initial_visual_feedback(
 
     # Image differencing: ask a VLM to describe the initial scene
     if config["use_img_differencing"] or config.get("use_video_differencing", False):
-        description = _describe_initial_scene(
+        initial_scene_artifact = _describe_initial_scene(
             visual_differencing_args, task_description, initial_base64,
             wrist_image_base64=initial_wrist_base64,
         )
+        description = initial_scene_artifact["content"]
         feedback = f"The initial state of the environment is described as follows:\n{description}"
         obs["full_prompt"][-1]["content"][0]["text"] += f"\n\n{feedback}"
         if args.debug:
             print(description)
 
-    return visual_feedback_imgs, visual_feedback_base64_history, task_description
+    return (
+        visual_feedback_imgs,
+        visual_feedback_base64_history,
+        task_description,
+        initial_scene_artifact,
+    )
 
 
 def _describe_initial_scene(
@@ -334,7 +343,7 @@ def _describe_initial_scene(
     task_description: str,
     image_base64: str,
     wrist_image_base64: str | None = None,
-) -> str:
+) -> dict[str, Any]:
     """Query a VLM to describe the initial environment state."""
     user_content: list[dict[str, Any]] = [
         {"type": "text", "text": task_description},
@@ -366,7 +375,14 @@ def _describe_initial_scene(
         },
         {"role": "user", "content": user_content},
     ]
-    return _query_model(visual_differencing_args, prompt)["content"]
+    response = _query_model(visual_differencing_args, prompt)
+    return {
+        "model": visual_differencing_args.model,
+        "prompt": prompt,
+        "content": response["content"],
+        "reasoning": response.get("reasoning"),
+        "task_description": task_description,
+    }
 
 
 def _get_visual_differencing_feedback(
@@ -510,17 +526,18 @@ def _query_initial_code(
     args: LaunchArgs,
     config: dict[str, Any],
     obs: dict[str, Any],
-) -> tuple[str, str | None, dict | None]:
+) -> tuple[str, str | None, dict | None, dict[str, Any] | None]:
     """Query the model for the initial code generation.
 
     Returns:
-        (raw_code, reasoning, ensemble_data)
+        (raw_code, reasoning, ensemble_data, raw_model_response)
     """
     # Save the initial prompt
     with open(os.path.join(config["output_dir"], "initial_prompt.txt"), "w") as f:
         f.write(str(obs["full_prompt"]))
 
     ensemble_data = None
+    raw_model_response = None
     if config["use_parallel_ensemble"]:
         if config.get("use_multimodel", False):
             print("RUNNING MULTIMODEL ENSEMBLE QUERY")
@@ -534,8 +551,13 @@ def _query_initial_code(
         }
     else:
         out = _query_model(args, obs["full_prompt"])
+        raw_model_response = {
+            "model": args.model,
+            "finish_reason": out.get("finish_reason"),
+            "raw_response": out.get("raw_response"),
+        }
 
-    return out["content"], out["reasoning"], ensemble_data
+    return out["content"], out["reasoning"], ensemble_data, raw_model_response
 
 
 def _build_recovery_prompt(
@@ -943,8 +965,14 @@ def _run_single_trial(
                 f.write(generated_raw_code)
             generated_reasoning = None
             generated_ensemble_data = None
+            generated_raw_model_response = None
         else:
-            generated_raw_code, generated_reasoning, generated_ensemble_data = _query_initial_code(
+            (
+                generated_raw_code,
+                generated_reasoning,
+                generated_ensemble_data,
+                generated_raw_model_response,
+            ) = _query_initial_code(
                 args, config, obs
             )
         return (
@@ -952,14 +980,21 @@ def _run_single_trial(
             generated_raw_code,
             generated_reasoning,
             generated_ensemble_data,
+            generated_raw_model_response,
         )
 
     # --- 2. Capture initial visual feedback and first code generation ---
     (
-        (visual_feedback_imgs, visual_feedback_base64_history, task_description),
+        (
+            visual_feedback_imgs,
+            visual_feedback_base64_history,
+            task_description,
+            initial_scene_artifact,
+        ),
         raw_code,
         reasoning,
         ensemble_data,
+        initial_raw_model_response,
     ) = _run_with_phase_timeout(
         trial,
         "pre-codegen",
@@ -1034,9 +1069,14 @@ def _run_single_trial(
 
     def _build_trial_metadata() -> dict[str, Any]:
         stderr_value = info_step.get("stderr", "")
+        num_nonempty_code_blocks = _count_nonempty_code_blocks(code_blocks)
         exclude_from_training = bool(
             truncated or "executing action in terminated episode" in stderr_value
         )
+        exclusion_reason = "sim_limit_reset" if exclude_from_training else None
+        if num_nonempty_code_blocks <= 0:
+            exclude_from_training = True
+            exclusion_reason = "empty_codegen"
         return {
             "trial": trial,
             "attempt": attempt_idx,
@@ -1047,20 +1087,38 @@ def _run_single_trial(
             "truncated": bool(truncated),
             "success": bool(info_step.get("sandbox_rc", 1) == 0),
             "exclude_from_training": exclude_from_training,
-            "exclusion_reason": "sim_limit_reset" if exclude_from_training else None,
+            "exclusion_reason": exclusion_reason,
+            "num_code_blocks": len(code_blocks),
+            "num_nonempty_code_blocks": num_nonempty_code_blocks,
         }
 
     # Parse initial code into blocks
     initial_blocks = _extract_code(raw_code)
-    code_blocks.extend(initial_blocks)
-    code_block_metadata.extend([{"generation": 0, "regenerated": False}] * len(initial_blocks))
     all_responses.append({
         "block_idx": [0],
         "code_blocks": initial_blocks,
         "decision": "initial",
         "initial_prompt": copy.deepcopy(obs["full_prompt"]),
         "reasoning": reasoning if reasoning is not None else "",
+        "initial_model_finish_reason": (
+            initial_raw_model_response.get("finish_reason")
+            if initial_raw_model_response is not None
+            else None
+        ),
+        "initial_model_raw_response": (
+            copy.deepcopy(initial_raw_model_response.get("raw_response"))
+            if initial_raw_model_response is not None
+            else None
+        ),
     })
+    if initial_scene_artifact is not None:
+        all_responses.append({
+            "initial_scene_model": initial_scene_artifact.get("model", ""),
+            "initial_scene_task_description": initial_scene_artifact.get("task_description", ""),
+            "initial_scene_prompt": copy.deepcopy(initial_scene_artifact.get("prompt", [])),
+            "initial_scene_raw_response": initial_scene_artifact.get("content", ""),
+            "initial_scene_reasoning": initial_scene_artifact.get("reasoning") or "",
+        })
     append_event(
         trajectory_data,
         "initial_generation",
@@ -1069,6 +1127,22 @@ def _run_single_trial(
         reasoning=reasoning if reasoning is not None else "",
         used_oracle_code=config["use_oracle_code"],
     )
+    if _count_nonempty_code_blocks(initial_blocks) > 0:
+        code_blocks.extend(initial_blocks)
+        code_block_metadata.extend([{"generation": 0, "regenerated": False}] * len(initial_blocks))
+    else:
+        info_step = {
+            "sandbox_rc": 1,
+            "stdout": "",
+            "stderr": "Model returned no executable code in initial generation.",
+            "task_completed": False,
+        }
+        append_event(
+            trajectory_data,
+            "empty_codegen",
+            phase="initial_generation",
+            raw_code=raw_code,
+        )
 
     with open(os.path.join(config["output_dir"], "all_responses.json"), "w") as f:
         json.dump(all_responses, f)
@@ -1082,6 +1156,52 @@ def _run_single_trial(
     reward = 0.0
     terminated = truncated = False
     code_block_idx = 0
+
+    if not code_blocks:
+        info_step = {
+            "sandbox_rc": 1,
+            "stdout": "",
+            "stderr": "Model returned no executable code in initial generation.",
+            "task_completed": False,
+        }
+        final_code = _annotate_code_blocks(code_blocks, code_block_metadata)
+        log_lines = _build_log_lines(
+            final_code,
+            info_step,
+            reward,
+            terminated,
+            truncated,
+            num_regenerations,
+            num_finishes,
+            0,
+            stderr_override="Model returned no executable code in initial generation.",
+        )
+        code_path = _save_trial_artifacts(
+            config, trial, attempt_idx, info_step["sandbox_rc"], reward,
+            False, final_code, raw_code, all_responses, log_lines, visual_feedback_imgs,
+            ensemble_data=ensemble_data,
+            multiturn_ensemble_data=multiturn_ensemble_data,
+            trajectory_data=trajectory_data,
+            transition_dataset=transition_dataset,
+            trial_metadata=_build_trial_metadata(),
+        )
+        final_summary = TrialSummary(
+            trial=trial,
+            success=False,
+            reward=reward,
+            terminated=terminated,
+            truncated=truncated,
+            sandbox_rc=info_step["sandbox_rc"],
+            log="\n".join(log_lines),
+            task_completed=False,
+            code_path=code_path,
+            num_regenerations=num_regenerations,
+            num_finishes=num_finishes,
+            num_code_blocks=0,
+        )
+        if partial_artifacts is not None:
+            partial_artifacts["final_summary"] = final_summary
+        return final_summary
 
     # Track whether we're recording frames (for video diff or record_video)
     recording_frames = (
@@ -1109,7 +1229,33 @@ def _run_single_trial(
         # Record frame index before step
         frame_start = env.get_video_frame_count() if recording_frames else 0
 
-        obs_next, reward, terminated, truncated, info_step = env.step(code)
+        try:
+            obs_next, reward, terminated, truncated, info_step = env.step(code)
+        except Exception as exc:
+            # Keep trial bookkeeping alive even if a simulator step raises, so we
+            # can still save attempt artifacts instead of dropping the whole trial.
+            info_step = {
+                "sandbox_rc": 1,
+                "stdout": "",
+                "stderr": traceback.format_exc(),
+                "task_completed": False,
+            }
+            reward = float(reward)
+            terminated = False
+            truncated = "terminated episode" in str(exc).lower()
+            append_event(
+                trajectory_data,
+                "step_exception",
+                code_block_idx=current_block_idx,
+                code=code,
+                phase_candidates=phase_candidates,
+                phase_tags=phase_tags,
+                snapshot_before=pre_snapshot_id,
+                error_type=type(exc).__name__,
+                error_message=str(exc),
+                stderr=info_step["stderr"],
+            )
+            break
 
         # Record frame index after step
         frame_end = env.get_video_frame_count() if recording_frames else 0
@@ -1198,6 +1344,24 @@ def _run_single_trial(
             if decision == "regenerate":
                 print("Model chose to regenerate code")
                 new_blocks = _extract_code(new_code)
+                if _count_nonempty_code_blocks(new_blocks) <= 0:
+                    all_responses.append({
+                        "multi_turn_prompt": decision_prompt if config.get("save_multiturn_prompts", False) else None,
+                        "block_idx": [current_block_idx],
+                        "code_blocks": new_blocks,
+                        "decision": "regenerate_empty",
+                        "reasoning": mt_reasoning if mt_reasoning is not None else "",
+                    })
+                    append_event(
+                        trajectory_data,
+                        "empty_codegen",
+                        phase="regenerate",
+                        code_block_idx=current_block_idx,
+                        raw_code=new_code,
+                    )
+                    info_step["sandbox_rc"] = 1
+                    info_step["stderr"] = "Model returned no executable code during regenerate."
+                    break
                 rollback_performed = False
                 rollback_snapshot_id = None
                 safe_snapshot_details = None
@@ -1371,7 +1535,7 @@ def _run_single_trial(
                             recovery_reason="model_finished_but_task_incomplete",
                         )
                         recovery_blocks = _extract_code(recovery_raw_code)
-                        if recovery_blocks:
+                        if _count_nonempty_code_blocks(recovery_blocks) > 0:
                             insert_idx = current_block_idx
                             all_responses.append({
                                 "multi_turn_prompt": recovery_prompt if config.get("save_multiturn_prompts", False) else None,
@@ -1401,6 +1565,14 @@ def _run_single_trial(
                             code_block_idx = insert_idx
                             num_recoveries += 1
                             attempted_recovery = True
+                        else:
+                            append_event(
+                                trajectory_data,
+                                "empty_codegen",
+                                phase="recovery",
+                                code_block_idx=current_block_idx,
+                                raw_code=recovery_raw_code,
+                            )
 
                 if attempted_recovery:
                     continue
