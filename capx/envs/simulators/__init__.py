@@ -5,6 +5,9 @@ from capx.envs.base import list_envs, register_env
 from .franka_real import FrankaRealLowLevel
 register_env("franka_real_low_level", FrankaRealLowLevel)
 
+from .widowx_real import WidowXRealLowLevel
+register_env("widowx_real_low_level", WidowXRealLowLevel)
+
 # NOTE: Can only have one of Robosuite or LIBERO installed at a time!
 # Using Robosuite run: uv sync --extra robosuite
 try:
