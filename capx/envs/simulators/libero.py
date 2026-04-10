@@ -39,6 +39,9 @@ class FrankaLiberoEnv(BaseEnv):
         enable_render: bool = False,
         control_freq: int = 20,
         viser_debug: bool = False,
+        record_transition_depth: bool = True,
+        record_transition_step_metadata: bool = True,
+        record_transition_fps: float | None = 20.0,
     ) -> None:
         self._post_success_step_budget_default = 240
         super().__init__()
@@ -49,6 +52,18 @@ class FrankaLiberoEnv(BaseEnv):
         self.segmentation_level = "instance"
         self._render_width = 800
         self._render_height = 512
+        self._record_transition_depth = record_transition_depth
+        self._record_transition_step_metadata = record_transition_step_metadata
+        self._record_transition_fps = (
+            None
+            if record_transition_fps is None or float(record_transition_fps) <= 0.0
+            else float(record_transition_fps)
+        )
+        self._record_transition_interval_s = (
+            None
+            if self._record_transition_fps is None
+            else 1.0 / self._record_transition_fps
+        )
 
         self.handle = load_libero_task(
             suite_name=suite_name,
@@ -79,6 +94,7 @@ class FrankaLiberoEnv(BaseEnv):
         self._subsample_rate = 4
         self._reset_state: dict[str, Any] | None = None
         self._transition_dataset: dict[str, Any] | None = None
+        self._last_recorded_transition_timestamp_s: float | None = None
         self._action_context_stack: list[dict[str, Any]] = []
         self._code_execution_active = False
         self._post_success_steps_remaining = 0
@@ -192,7 +208,12 @@ class FrankaLiberoEnv(BaseEnv):
             trial=seed if seed is not None else 0,
             task_prompt=self.handle.task_language,
         )
-        set_initial_observation(self._transition_dataset, obs)
+        self._transition_dataset["record_transition_fps"] = self._record_transition_fps
+        initial_observation = (
+            self._strip_depth_from_observation(obs) if not self._record_transition_depth else obs
+        )
+        set_initial_observation(self._transition_dataset, initial_observation)
+        self._last_recorded_transition_timestamp_s = None
 
         info = {"task_prompt": self.handle.task_language}
         return obs, info
@@ -512,6 +533,7 @@ class FrankaLiberoEnv(BaseEnv):
             else self.home_joint_position.copy(),
             "code_execution_active": bool(self._code_execution_active),
             "post_success_steps_remaining": int(self._post_success_steps_remaining),
+            "last_recorded_transition_timestamp_s": self._last_recorded_transition_timestamp_s,
         }
 
     def capture_state(self) -> dict[str, Any]:
@@ -540,6 +562,7 @@ class FrankaLiberoEnv(BaseEnv):
         self._sim_step_count = int(state.get("sim_step_count", 0))
         self._code_execution_active = bool(state.get("code_execution_active", False))
         self._post_success_steps_remaining = int(state.get("post_success_steps_remaining", 0))
+        self._last_recorded_transition_timestamp_s = state.get("last_recorded_transition_timestamp_s")
 
         if state.get("home_joint_position") is not None:
             self.home_joint_position = np.asarray(state["home_joint_position"], dtype=np.float64).copy()
@@ -783,11 +806,27 @@ class FrankaLiberoEnv(BaseEnv):
                 [self._current_obs["robot0_gripper_qpos"][0] / self.gripper_metric_length],
             ]
         )
+        low_level_observation = self._copy_state_value(self._current_obs)
+        if not self._record_transition_depth and isinstance(low_level_observation, dict):
+            low_level_observation.pop("agentview_depth", None)
+            low_level_observation.pop("robot0_eye_in_hand_depth", None)
+
         return {
-            "low_level_observation": self._copy_state_value(self._current_obs),
+            "low_level_observation": low_level_observation,
             "robot_joint_pos": robot_joint_pos.copy(),
             "robot_cartesian_pos": robot_cartesian_pos.copy(),
         }
+
+    def _strip_depth_from_observation(self, observation: dict[str, Any]) -> dict[str, Any]:
+        observation_copy = self._copy_state_value(observation)
+        for camera_name in ("agentview", "robot0_eye_in_hand"):
+            camera_observation = observation_copy.get(camera_name)
+            if not isinstance(camera_observation, dict):
+                continue
+            images = camera_observation.get("images")
+            if isinstance(images, dict):
+                images.pop("depth", None)
+        return observation_copy
 
     def _record_transition(
         self,
@@ -798,9 +837,19 @@ class FrankaLiberoEnv(BaseEnv):
     ) -> None:
         if self._transition_dataset is None or self._current_obs is None:
             return
+        timestamp_s = self.get_current_time_s()
+        force_record = bool(self._sim_step_count >= self.max_steps) or bool(self._current_done)
+        if (
+            self._record_transition_interval_s is not None
+            and not force_record
+            and self._last_recorded_transition_timestamp_s is not None
+            and (timestamp_s - self._last_recorded_transition_timestamp_s)
+            < (self._record_transition_interval_s - 1e-9)
+        ):
+            return
         append_transition(
             self._transition_dataset,
-            timestamp_s=self.get_current_time_s(),
+            timestamp_s=timestamp_s,
             wall_time_s=time.time(),
             sim_step_count=int(self._sim_step_count),
             action=np.asarray(action, dtype=np.float64).copy(),
@@ -810,8 +859,9 @@ class FrankaLiberoEnv(BaseEnv):
             truncated=bool(self._sim_step_count >= self.max_steps),
             source=source,
             action_context=self._current_action_context(),
-            metadata=metadata,
+            metadata=metadata if self._record_transition_step_metadata else None,
         )
+        self._last_recorded_transition_timestamp_s = timestamp_s
 
     # Viser debugging
     def _update_viser_server(self) -> None:
