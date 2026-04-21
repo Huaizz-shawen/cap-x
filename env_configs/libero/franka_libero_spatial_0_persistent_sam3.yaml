@@ -1,7 +1,7 @@
-# LIBERO Spatial Task 0: pick up the black bowl between the plate and the ramekin
-# Change suite_name and task_id in low_level to run different tasks.
-# Available suites: libero_10, libero_90, libero_object, libero_spatial, libero_goal
-# Use: python capx/envs/launch.py --config-path env_configs/libero/franka_libero_spatial_0.yaml --web-ui True
+# LIBERO Spatial Task 0 with persistent external SAM3 service.
+# Difference from franka_libero_spatial_0.yaml:
+# - Remove launch_sam3_server from api_servers
+# - Use CAPX_SAM3_SERVICE_URL env var (see capx/integrations/vision/sam3.py)
 
 env:
   _target_: capx.envs.tasks.franka.franka_libero_env.FrankaLiberoCodeEnv
@@ -49,17 +49,10 @@ api_servers:
     host: 127.0.0.1
     robot: panda_description
     target_link: panda_hand
-  
+
   - _target_: capx.serving.launch_contact_graspnet_server.main
     port: 8115
     host: 127.0.0.1
-
-  - _target_: capx.serving.launch_sam3_server.main
-    device: cuda
-    port: 8114
-    host: 127.0.0.1
-    checkpoint_path: /inspire/hdd/project/exploration-topic/public/zzhuai/LIBERO/third_party/checkpoints/sam3.pt
-    load_from_hf: false
 
 record_video: true
 output_dir: ./outputs/franka_libero_spatial_0

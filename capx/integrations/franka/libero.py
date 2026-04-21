@@ -2,6 +2,7 @@ import io
 import pathlib
 import time
 import copy
+import logging
 from typing import Any
 
 import numpy as np
@@ -33,6 +34,7 @@ from capx.utils.depth_utils import (
 from capx.integrations.motion.pyroki import init_pyroki
 
 _curobo_api = None
+_LOGGER = logging.getLogger(__name__)
 
 def _get_curobo_api():
     """Lazy import of cuRobo API to avoid warp init before Isaac Sim."""
@@ -49,6 +51,21 @@ class FrankaLiberoApi(ApiBase):
     """
 
     _TCP_OFFSET = np.array([0.0, 0.0, -0.1], dtype=np.float64)
+
+    @staticmethod
+    def _extract_arm_joints(cfg: np.ndarray | list[float]) -> np.ndarray:
+        cfg_arr = np.asarray(cfg, dtype=np.float64).reshape(-1)
+        if cfg_arr.size == 8:
+            return cfg_arr[:7]
+        if cfg_arr.size == 7:
+            return cfg_arr
+        if cfg_arr.size > 8:
+            _LOGGER.warning("Unexpected IK cfg size=%d; truncating to first 7 joints", cfg_arr.size)
+            return cfg_arr[:7]
+        if cfg_arr.size == 0:
+            raise ValueError("IK returned empty cfg; cannot extract 7 arm joints")
+        _LOGGER.warning("Unexpected IK cfg size=%d; padding to 7 joints", cfg_arr.size)
+        return np.pad(cfg_arr, (0, 7 - cfg_arr.size), mode="edge")
     
     def __init__(self, env: BaseEnv, use_sam3: bool = True) -> None:
         super().__init__(env)
@@ -415,7 +432,7 @@ class FrankaLiberoApi(ApiBase):
                     target_wxyz=quat_wxyz,
                     prev_cfg=self.cfg,
                 )
-            joints_z_offset = np.asarray(self.cfg[:-1], dtype=np.float64).reshape(7)
+            joints_z_offset = self._extract_arm_joints(self.cfg)
 
             self._env.move_to_joints_blocking(joints_z_offset)
 
@@ -434,7 +451,7 @@ class FrankaLiberoApi(ApiBase):
                 target_wxyz=quat_wxyz,
                 prev_cfg=self.cfg,
             )
-        joints = np.asarray(self.cfg[:-1], dtype=np.float64).reshape(7)
+        joints = self._extract_arm_joints(self.cfg)
         self._env.move_to_joints_blocking(joints)
 
     def open_gripper(self) -> None:

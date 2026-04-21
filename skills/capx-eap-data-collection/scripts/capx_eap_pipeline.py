@@ -1246,6 +1246,88 @@ def _export(args: argparse.Namespace) -> dict[str, str]:
     }
 
 
+def _export_shards(args: argparse.Namespace) -> dict[str, object]:
+    """Export each transition dataset into an independent LeRobot shard directory."""
+    repo_root = _find_repo_root(args.repo_root)
+    python_bin = _select_python(repo_root)
+    input_root = (repo_root / args.input_root).resolve() if not Path(args.input_root).is_absolute() else Path(args.input_root).resolve()
+    output_root = (repo_root / args.output_root).resolve() if not Path(args.output_root).is_absolute() else Path(args.output_root).resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    transition_paths = sorted(input_root.glob("**/transition_dataset/data.pkl.gz"))
+    if not transition_paths:
+        raise FileNotFoundError(f"No transition datasets found under {input_root}")
+
+    shard_results: list[dict[str, object]] = []
+    exported = 0
+    skipped = 0
+    cleaned = 0
+
+    for transition_path in transition_paths:
+        attempt_dir = transition_path.parent.parent
+        rel_attempt_dir = attempt_dir.relative_to(input_root)
+        shard_name = "__".join(rel_attempt_dir.parts)
+        shard_root = output_root / shard_name
+        manifest_path = shard_root / "manifest.json"
+
+        result: dict[str, object] = {
+            "transition_path": str(transition_path),
+            "attempt_dir": str(attempt_dir),
+            "shard_name": shard_name,
+            "shard_root": str(shard_root),
+        }
+
+        if manifest_path.exists() and not args.reexport_existing:
+            result["status"] = "skipped_existing"
+            skipped += 1
+            shard_results.append(result)
+            continue
+
+        cmd = [
+            python_bin,
+            "-m",
+            "capx.data.export_lerobot_video_dataset",
+            "--input-root",
+            str(attempt_dir),
+            "--output-root",
+            str(shard_root),
+            "--robot-type",
+            args.robot_type,
+            "--crf",
+            str(args.crf),
+            "--chunk-size",
+            str(args.chunk_size),
+        ]
+        if args.fps is not None:
+            cmd.extend(["--fps", str(args.fps)])
+        if args.include_excluded:
+            cmd.append("--include-excluded")
+
+        _run(cmd, cwd=repo_root)
+        result["status"] = "exported"
+        exported += 1
+
+        if args.cleanup_transition_dataset:
+            shutil.rmtree(transition_path.parent, ignore_errors=True)
+            result["transition_dataset_cleaned"] = True
+            cleaned += 1
+
+        shard_results.append(result)
+
+    summary = {
+        "repo_root": str(repo_root),
+        "input_root": str(input_root),
+        "shard_output_root": str(output_root),
+        "num_transition_datasets": len(transition_paths),
+        "num_exported": exported,
+        "num_skipped_existing": skipped,
+        "num_transition_datasets_cleaned": cleaned,
+        "shards": shard_results,
+    }
+    print(json.dumps(summary, indent=2))
+    return summary
+
+
 def _validate(args: argparse.Namespace) -> dict[str, object]:
     dataset_root = Path(args.dataset_root).expanduser().resolve()
     validate_env = _build_validate_env(
@@ -1359,6 +1441,27 @@ def _add_export_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--include-excluded", action="store_true")
 
 
+def _add_export_shards_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--repo-root", default=None)
+    parser.add_argument("--input-root", required=True)
+    parser.add_argument("--output-root", required=True, help="Root directory for per-attempt LeRobot shards.")
+    parser.add_argument("--robot-type", default="franka")
+    parser.add_argument("--fps", type=int, default=None)
+    parser.add_argument("--chunk-size", type=int, default=1000)
+    parser.add_argument("--crf", type=int, default=30)
+    parser.add_argument("--include-excluded", action="store_true")
+    parser.add_argument(
+        "--cleanup-transition-dataset",
+        action="store_true",
+        help="Delete each attempt's transition_dataset directory after successful shard export.",
+    )
+    parser.add_argument(
+        "--reexport-existing",
+        action="store_true",
+        help="Re-export shards even if shard_root/manifest.json already exists.",
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Orchestrate CaP-X collection, LeRobot export, and validation.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1382,6 +1485,9 @@ def main() -> None:
 
     export_parser = subparsers.add_parser("export")
     _add_export_args(export_parser)
+
+    export_shards_parser = subparsers.add_parser("export-shards")
+    _add_export_shards_args(export_shards_parser)
 
     cleanup_parser = subparsers.add_parser("cleanup-services")
     cleanup_parser.add_argument("--repo-root", default=None)
@@ -1444,6 +1550,10 @@ def main() -> None:
 
     if args.command == "export":
         print(json.dumps(_export(args), indent=2))
+        return
+
+    if args.command == "export-shards":
+        _export_shards(args)
         return
 
     if args.command == "validate":

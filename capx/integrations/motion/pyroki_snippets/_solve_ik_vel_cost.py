@@ -49,6 +49,27 @@ def solve_ik(
         cfg: onp.ndarray. Shape: (robot.joint.actuated_count,).
     """
     assert target_position.shape == (3,) and target_wxyz.shape == (4,)
+    num_joints = robot.joints.num_actuated_joints
+
+    def _coerce_cfg_shape(cfg: onp.ndarray | None, name: str) -> onp.ndarray | None:
+        if cfg is None:
+            return None
+        arr = onp.asarray(cfg, dtype=onp.float64).reshape(-1)
+        if arr.shape[0] == num_joints:
+            return arr
+        # Some callers pass an augmented robot state (e.g. 7 joints + gripper),
+        # while IK only expects actuated arm joints.
+        if arr.shape[0] > num_joints:
+            return arr[:num_joints]
+        # Keep solver stable even when a shorter vector is provided.
+        if arr.shape[0] == 0:
+            return onp.zeros((num_joints,), dtype=onp.float64)
+        pad = onp.repeat(arr[-1], num_joints - arr.shape[0])
+        return onp.concatenate([arr, pad], axis=0)
+
+    prev_cfg = _coerce_cfg_shape(prev_cfg, "prev_cfg")
+    initial_cfg = _coerce_cfg_shape(initial_cfg, "initial_cfg")
+
     target_link_index = robot.links.names.index(target_link_name)
     init = None if initial_cfg is None else jnp.array(initial_cfg)
     cfg = _solve_ik_jax(
@@ -59,7 +80,7 @@ def solve_ik(
         jnp.array(prev_cfg),
         init,
     )
-    assert cfg.shape == (robot.joints.num_actuated_joints,)
+    assert cfg.shape == (num_joints,)
     return onp.array(cfg)
 
 

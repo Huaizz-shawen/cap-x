@@ -104,23 +104,32 @@ def append_transition(
     source: str,
     action_context: dict[str, Any] | None = None,
     metadata: dict[str, Any] | None = None,
+    include_wall_time_s: bool = True,
+    include_source: bool = True,
+    include_action_context: bool = True,
+    include_metadata: bool = True,
 ) -> None:
-    transition_dataset["transitions"].append(
-        {
-            "transition_idx": len(transition_dataset["transitions"]),
-            "timestamp_s": float(timestamp_s),
-            "wall_time_s": float(wall_time_s),
-            "sim_step_count": sim_step_count,
-            "action": _copy_value(action),
-            "observation": _copy_value(observation),
-            "reward": reward,
-            "done": done,
-            "truncated": truncated,
-            "source": source,
-            "action_context": _copy_value(action_context) if action_context is not None else None,
-            "metadata": _copy_value(metadata) if metadata is not None else {},
-        }
-    )
+    transition = {
+        "transition_idx": len(transition_dataset["transitions"]),
+        "timestamp_s": float(timestamp_s),
+        "sim_step_count": sim_step_count,
+        "action": _copy_value(action),
+        "observation": _copy_value(observation),
+        "reward": reward,
+        "done": done,
+        "truncated": truncated,
+    }
+    if include_wall_time_s:
+        transition["wall_time_s"] = float(wall_time_s)
+    if include_source:
+        transition["source"] = source
+    if include_action_context:
+        transition["action_context"] = (
+            _copy_value(action_context) if action_context is not None else None
+        )
+    if include_metadata:
+        transition["metadata"] = _copy_value(metadata) if metadata is not None else {}
+    transition_dataset["transitions"].append(transition)
 
 
 def save_transition_dataset(trial_dir: Path, transition_dataset: dict[str, Any]) -> None:
