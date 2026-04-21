@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import logging
 import time
 from contextlib import contextmanager
 from typing import Any, Literal
@@ -24,9 +23,6 @@ from capx.integrations.libero import load_libero_task
 from capx.utils.camera_utils import obs_get_rgb
 from capx.utils.depth_utils import depth_color_to_pointcloud
 
-logger = logging.getLogger(__name__)
-
-
 class FrankaLiberoEnv(BaseEnv):
     """Franka Libero environment.
 
@@ -43,11 +39,9 @@ class FrankaLiberoEnv(BaseEnv):
         enable_render: bool = False,
         control_freq: int = 20,
         viser_debug: bool = False,
-        transition_low_level_mode: Literal["full", "rgb_only", "none"] = "full",
-        transition_include_depth: bool = True,
-        transition_include_segmentation: bool = True,
-        transition_record_hz: float | None = None,
-        transition_export_only: bool = False,
+        record_transition_depth: bool = True,
+        record_transition_step_metadata: bool = True,
+        record_transition_fps: float | None = 20.0,
     ) -> None:
         self._post_success_step_budget_default = 240
         super().__init__()
@@ -58,6 +52,18 @@ class FrankaLiberoEnv(BaseEnv):
         self.segmentation_level = "instance"
         self._render_width = 800
         self._render_height = 512
+        self._record_transition_depth = record_transition_depth
+        self._record_transition_step_metadata = record_transition_step_metadata
+        self._record_transition_fps = (
+            None
+            if record_transition_fps is None or float(record_transition_fps) <= 0.0
+            else float(record_transition_fps)
+        )
+        self._record_transition_interval_s = (
+            None
+            if self._record_transition_fps is None
+            else 1.0 / self._record_transition_fps
+        )
 
         self.handle = load_libero_task(
             suite_name=suite_name,
@@ -78,17 +84,6 @@ class FrankaLiberoEnv(BaseEnv):
         self._current_info = None
         self._current_reward = None
         self._current_done = None
-        self._transition_low_level_mode = transition_low_level_mode
-        self._transition_include_depth = bool(transition_include_depth)
-        self._transition_include_segmentation = bool(transition_include_segmentation)
-        self._transition_export_only = bool(transition_export_only)
-        if transition_record_hz is None:
-            self._transition_record_every_steps = 1
-        else:
-            hz = float(transition_record_hz)
-            if hz <= 0:
-                raise ValueError("transition_record_hz must be > 0 when provided")
-            self._transition_record_every_steps = max(1, int(round(self._control_freq / hz)))
 
         # Video capture
         self._record_frames = False
@@ -99,10 +94,10 @@ class FrankaLiberoEnv(BaseEnv):
         self._subsample_rate = 4
         self._reset_state: dict[str, Any] | None = None
         self._transition_dataset: dict[str, Any] | None = None
+        self._last_recorded_transition_timestamp_s: float | None = None
         self._action_context_stack: list[dict[str, Any]] = []
         self._code_execution_active = False
         self._post_success_steps_remaining = 0
-        self._depth_anomaly_logged: set[str] = set()
 
         # Robot link indices for transforms
         self.gripper_metric_length = 0.04
@@ -213,7 +208,12 @@ class FrankaLiberoEnv(BaseEnv):
             trial=seed if seed is not None else 0,
             task_prompt=self.handle.task_language,
         )
-        set_initial_observation(self._transition_dataset, self._build_initial_observation_for_dataset(obs))
+        self._transition_dataset["record_transition_fps"] = self._record_transition_fps
+        initial_observation = (
+            self._strip_depth_from_observation(obs) if not self._record_transition_depth else obs
+        )
+        set_initial_observation(self._transition_dataset, initial_observation)
+        self._last_recorded_transition_timestamp_s = None
 
         info = {"task_prompt": self.handle.task_language}
         return obs, info
@@ -533,6 +533,7 @@ class FrankaLiberoEnv(BaseEnv):
             else self.home_joint_position.copy(),
             "code_execution_active": bool(self._code_execution_active),
             "post_success_steps_remaining": int(self._post_success_steps_remaining),
+            "last_recorded_transition_timestamp_s": self._last_recorded_transition_timestamp_s,
         }
 
     def capture_state(self) -> dict[str, Any]:
@@ -561,6 +562,7 @@ class FrankaLiberoEnv(BaseEnv):
         self._sim_step_count = int(state.get("sim_step_count", 0))
         self._code_execution_active = bool(state.get("code_execution_active", False))
         self._post_success_steps_remaining = int(state.get("post_success_steps_remaining", 0))
+        self._last_recorded_transition_timestamp_s = state.get("last_recorded_transition_timestamp_s")
 
         if state.get("home_joint_position") is not None:
             self.home_joint_position = np.asarray(state["home_joint_position"], dtype=np.float64).copy()
@@ -640,40 +642,8 @@ class FrankaLiberoEnv(BaseEnv):
             if camera_name + "_image" in self._current_obs:
                 obs[camera_name]["images"]["rgb"] = self._current_obs[camera_name + "_image"][::-1]
             if camera_name + "_depth" in self._current_obs:
-                # Robosuite expects normalized depth in [0, 1]. In practice, simulator
-                # outputs can occasionally contain tiny out-of-range values or NaN/Inf,
-                # which would trip an assertion in get_real_depth_map and abort trials.
-                depth_normalized = np.asarray(
-                    self._current_obs[camera_name + "_depth"][::-1], dtype=np.float32
-                )
-                finite = np.isfinite(depth_normalized)
-                raw_min = float(np.min(depth_normalized[finite])) if np.any(finite) else float("nan")
-                raw_max = float(np.max(depth_normalized[finite])) if np.any(finite) else float("nan")
-                nan_count = int(np.isnan(depth_normalized).sum())
-                inf_count = int(np.isinf(depth_normalized).sum())
-                out_of_range = bool(np.any((depth_normalized < 0.0) | (depth_normalized > 1.0)))
-                if (
-                    camera_name not in self._depth_anomaly_logged
-                    and (nan_count > 0 or inf_count > 0 or out_of_range)
-                ):
-                    logger.warning(
-                        "Depth anomaly detected for %s: min=%.6f max=%.6f nan=%d inf=%d",
-                        camera_name,
-                        raw_min,
-                        raw_max,
-                        nan_count,
-                        inf_count,
-                    )
-                    self._depth_anomaly_logged.add(camera_name)
-                depth_normalized = np.nan_to_num(
-                    depth_normalized,
-                    nan=1.0,
-                    posinf=1.0,
-                    neginf=0.0,
-                )
-                depth_normalized = np.clip(depth_normalized, 0.0, 1.0)
                 depth_metric = get_real_depth_map(
-                    self.handle.env.sim, depth_normalized
+                    self.handle.env.sim, self._current_obs[camera_name + "_depth"][::-1]
                 )
                 obs[camera_name]["images"]["depth"] = depth_metric
             if camera_name + "_segmentation_" + self.segmentation_level in self._current_obs:
@@ -814,70 +784,6 @@ class FrankaLiberoEnv(BaseEnv):
             return None
         return self._copy_state_value(self._action_context_stack[-1])
 
-    def _build_initial_observation_for_dataset(self, observation: dict[str, Any]) -> dict[str, Any]:
-        """Build initial observation payload for transition dataset."""
-        if self._transition_low_level_mode == "full":
-            return self._copy_state_value(observation)
-
-        compact: dict[str, Any] = {}
-        if "robot_joint_pos" in observation:
-            compact["robot_joint_pos"] = np.asarray(observation["robot_joint_pos"], dtype=np.float64).copy()
-        if "robot_cartesian_pos" in observation:
-            compact["robot_cartesian_pos"] = np.asarray(
-                observation["robot_cartesian_pos"], dtype=np.float64
-            ).copy()
-
-        if self._transition_low_level_mode == "none":
-            return compact
-
-        for camera_name in ("agentview", "robot0_eye_in_hand"):
-            camera = observation.get(camera_name)
-            if not isinstance(camera, dict):
-                continue
-            images = camera.get("images", {})
-            if not isinstance(images, dict):
-                continue
-
-            selected_images: dict[str, Any] = {}
-            rgb = images.get("rgb")
-            if rgb is not None:
-                selected_images["rgb"] = np.asarray(rgb).copy()
-            if self._transition_include_depth:
-                depth = images.get("depth")
-                if depth is not None:
-                    selected_images["depth"] = np.asarray(depth).copy()
-            if self._transition_include_segmentation:
-                segmentation = images.get("segmentation")
-                if segmentation is not None:
-                    selected_images["segmentation"] = np.asarray(segmentation).copy()
-
-            if selected_images:
-                compact[camera_name] = {"images": selected_images}
-
-        return compact
-
-    def _build_low_level_observation_for_dataset(self) -> dict[str, Any]:
-        """Build per-transition low-level observation payload for transition dataset."""
-        if self._current_obs is None:
-            return {}
-        if self._transition_low_level_mode == "full":
-            return self._copy_state_value(self._current_obs)
-        if self._transition_low_level_mode == "none":
-            return {}
-
-        compact: dict[str, Any] = {}
-        for key, value in self._current_obs.items():
-            include = False
-            if key.endswith("_image"):
-                include = True
-            elif self._transition_include_depth and key.endswith("_depth"):
-                include = True
-            elif self._transition_include_segmentation and "_segmentation_" in key:
-                include = True
-            if include:
-                compact[key] = np.asarray(value).copy()
-        return compact
-
     def _build_transition_observation(self) -> dict[str, Any]:
         gripper_robot_base = (
             vtf.SE3(wxyz_xyz=self.base_link_wxyz_xyz).inverse()
@@ -900,11 +806,27 @@ class FrankaLiberoEnv(BaseEnv):
                 [self._current_obs["robot0_gripper_qpos"][0] / self.gripper_metric_length],
             ]
         )
+        low_level_observation = self._copy_state_value(self._current_obs)
+        if not self._record_transition_depth and isinstance(low_level_observation, dict):
+            low_level_observation.pop("agentview_depth", None)
+            low_level_observation.pop("robot0_eye_in_hand_depth", None)
+
         return {
-            "low_level_observation": self._build_low_level_observation_for_dataset(),
+            "low_level_observation": low_level_observation,
             "robot_joint_pos": robot_joint_pos.copy(),
             "robot_cartesian_pos": robot_cartesian_pos.copy(),
         }
+
+    def _strip_depth_from_observation(self, observation: dict[str, Any]) -> dict[str, Any]:
+        observation_copy = self._copy_state_value(observation)
+        for camera_name in ("agentview", "robot0_eye_in_hand"):
+            camera_observation = observation_copy.get(camera_name)
+            if not isinstance(camera_observation, dict):
+                continue
+            images = camera_observation.get("images")
+            if isinstance(images, dict):
+                images.pop("depth", None)
+        return observation_copy
 
     def _record_transition(
         self,
@@ -915,11 +837,19 @@ class FrankaLiberoEnv(BaseEnv):
     ) -> None:
         if self._transition_dataset is None or self._current_obs is None:
             return
-        if self._sim_step_count % self._transition_record_every_steps != 0:
+        timestamp_s = self.get_current_time_s()
+        force_record = bool(self._sim_step_count >= self.max_steps) or bool(self._current_done)
+        if (
+            self._record_transition_interval_s is not None
+            and not force_record
+            and self._last_recorded_transition_timestamp_s is not None
+            and (timestamp_s - self._last_recorded_transition_timestamp_s)
+            < (self._record_transition_interval_s - 1e-9)
+        ):
             return
         append_transition(
             self._transition_dataset,
-            timestamp_s=self.get_current_time_s(),
+            timestamp_s=timestamp_s,
             wall_time_s=time.time(),
             sim_step_count=int(self._sim_step_count),
             action=np.asarray(action, dtype=np.float64).copy(),
@@ -929,12 +859,9 @@ class FrankaLiberoEnv(BaseEnv):
             truncated=bool(self._sim_step_count >= self.max_steps),
             source=source,
             action_context=self._current_action_context(),
-            metadata=metadata,
-            include_wall_time_s=not self._transition_export_only,
-            include_source=not self._transition_export_only,
-            include_action_context=not self._transition_export_only,
-            include_metadata=not self._transition_export_only,
+            metadata=metadata if self._record_transition_step_metadata else None,
         )
+        self._last_recorded_transition_timestamp_s = timestamp_s
 
     # Viser debugging
     def _update_viser_server(self) -> None:
