@@ -93,6 +93,7 @@ DEFAULT_RETRY_MAX_ATTEMPTS = 12
 DEFAULT_RETRY_MAX_WALLTIME_S = 7200.0
 DEFAULT_RETRY_INITIAL_S = 15.0
 DEFAULT_RETRY_MAX_SLEEP_S = 240.0
+DEFAULT_SINGLE_MODEL_ENSEMBLE_TEMPERATURES = (0.1, 0.5, 0.9)
 
 # ---------------------------------------------------------------------------
 # Ensemble configuration
@@ -174,6 +175,26 @@ def _load_request_retry_config() -> RequestRetryConfig:
         retry_initial_s=_env_float("CAPX_MODEL_RETRY_INITIAL_S", DEFAULT_RETRY_INITIAL_S),
         retry_max_sleep_s=_env_float("CAPX_MODEL_RETRY_MAX_SLEEP_S", DEFAULT_RETRY_MAX_SLEEP_S),
     )
+
+
+def _load_single_model_ensemble_temperatures() -> list[float]:
+    raw = os.getenv("CAPX_SINGLE_MODEL_ENSEMBLE_TEMPERATURES")
+    if not raw:
+        return list(DEFAULT_SINGLE_MODEL_ENSEMBLE_TEMPERATURES)
+    parsed: list[float] = []
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            value = float(token)
+        except ValueError:
+            continue
+        if 0.0 <= value <= 2.0:
+            parsed.append(value)
+    # De-duplicate while preserving order
+    deduped = list(dict.fromkeys(parsed))
+    return deduped or list(DEFAULT_SINGLE_MODEL_ENSEMBLE_TEMPERATURES)
 
 
 def _compute_retry_sleep_seconds(attempt: int, config: RequestRetryConfig) -> float:
@@ -777,7 +798,7 @@ def query_single_model_ensemble(
     model: str,
     is_multiturn = False,
 ) -> dict[str, Any]:
-    """Query the same model 9 times (with temperatures 0.1 to 0.9) and synthesize final output.
+    """Query the same model at multiple temperatures and synthesize final output.
 
     Args:
         args: Configuration with server URL and model settings
@@ -805,10 +826,10 @@ def query_single_model_ensemble(
             print(f"[Single Model Ensemble] {model} temp={temp} FAILED: {error_msg}")
             return {"model": model, "temp": temp, "content": error_msg, "ok": False}
 
-    # Query same model with 9 different temperatures (0.1 to 0.9)
-    temperatures = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+    temperatures = _load_single_model_ensemble_temperatures()
     responses = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=9) as executor:
+    max_workers = max(1, len(temperatures))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(query_single, t): t for t in temperatures}
         for future in concurrent.futures.as_completed(futures):
             resp = future.result()

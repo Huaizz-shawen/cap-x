@@ -1,5 +1,8 @@
 # Usage:
-#   uv run capx/envs/launch.py --config-path env_configs/libero/franka_libero.yaml
+#   uv run capx/envs/launch.py --config-path env_configs/libero/franka_libero_ensemble_same_model.yaml
+#
+# Same as franka_libero.yaml, but enables single-model parallel ensemble.
+# This avoids hard dependency on multimodel synthesis backends (e.g. azure/openai/gpt-5.2).
 
 env:
   _target_: capx.envs.tasks.franka.franka_libero_env.FrankaLiberoCodeEnv
@@ -60,7 +63,7 @@ api_servers:
 record_video: true
 output_dir: ./outputs/franka_libero
 use_img_differencing: true
-use_parallel_ensemble: false
+use_parallel_ensemble: true
 use_multimodel: false
 
 trials: 50

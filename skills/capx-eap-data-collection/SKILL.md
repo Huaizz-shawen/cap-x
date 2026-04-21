@@ -39,6 +39,13 @@ Do not use this skill for editing policy code inside `cap-x` unless the user is 
 
 ## Preferred Defaults
 
+- Execution contract (default unless user explicitly overrides):
+  - Use explicit interpreter: `.venv-libero/bin/python`.
+  - Use non-privileged LIBERO visual pipeline (`privileged: false`) with `--use-img-differencing`.
+  - Use single-model parallel ensemble (not multimodel): `use_parallel_ensemble: true`, `use_multimodel: false`.
+  - Use 3-temperature ensemble for code agent via env var: `CAPX_SINGLE_MODEL_ENSEMBLE_TEMPERATURES=0.1,0.5,0.9`.
+  - Use `--num-workers 1` and `--detached` for long runs.
+  - Keep all non-task parameters fixed across experiments; only change task dimensions (`suite_name/task_id`, trials, manifest filters, output dir names).
 - For EAP development, start with LIBERO privileged configs because simulator rewind and rollback are easier to validate there.
 - For non-privileged collection, prefer `--use-img-differencing` so the planner gets visual feedback across turns instead of relying only on stdout/stderr.
 - For long-running collection, prefer `--detached` so the workflow is not tied to the current IDE or terminal session. Use `--tmux-session <name>` only when you explicitly want an interactive multiplexer session.
@@ -61,11 +68,12 @@ Do not use this skill for editing policy code inside `cap-x` unless the user is 
 Single collection run:
 
 ```bash
-python skills/capx-eap-data-collection/scripts/capx_eap_pipeline.py collect \
+CAPX_SINGLE_MODEL_ENSEMBLE_TEMPERATURES=0.1,0.5,0.9 \
+.venv-libero/bin/python skills/capx-eap-data-collection/scripts/capx_eap_pipeline.py collect \
   --repo-root /media/user/B29202FA9202C2B91/cap-x \
   --api-bash-profile codex_gemini_vdm \
-  --config-path env_configs/libero/franka_libero_goal_1.yaml \
-  --output-dir outputs/codex_key_goal1_10trials_vdm \
+  --config-path env_configs/libero/franka_libero_ensemble_same_model.yaml \
+  --output-dir outputs/libero_nonpriv_ensemble3_task0_10trials \
   --total-trials 10 \
   --num-workers 1 \
   --enable-eap-rollback \
