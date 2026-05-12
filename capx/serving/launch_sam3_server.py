@@ -31,6 +31,9 @@ _DEVICE: str = "cuda"
 
 # Semaphore to serialize GPU access (prevents OOM from concurrent inference)
 _GPU_SEMAPHORE = asyncio.Semaphore(1)
+DEFAULT_SHARED_SAM3_CHECKPOINT = (
+    "/inspire/hdd/project/exploration-topic/public/zzhuai/LIBERO/third_party/checkpoints/sam3.pt"
+)
 
 
 async def _run_on_gpu(fn, *args, **kwargs):
@@ -38,6 +41,21 @@ async def _run_on_gpu(fn, *args, **kwargs):
     async with _GPU_SEMAPHORE:
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, functools.partial(fn, *args, **kwargs))
+
+
+def _resolve_checkpoint_path(checkpoint_path: str | None) -> str | None:
+    """Resolve SAM3 checkpoint path with explicit > env > shared-default precedence."""
+    if checkpoint_path:
+        return checkpoint_path
+
+    env_checkpoint = os.environ.get("CAPX_SAM3_CHECKPOINT_PATH")
+    if env_checkpoint:
+        return env_checkpoint
+
+    if os.path.exists(DEFAULT_SHARED_SAM3_CHECKPOINT):
+        return DEFAULT_SHARED_SAM3_CHECKPOINT
+
+    return None
 
 # --- Helper Functions ---
 
@@ -258,21 +276,37 @@ def main(
 
     logger.info("Loading SAM3 model...")
     try:
-        if checkpoint_path:
-            if not os.path.exists(checkpoint_path):
+        resolved_checkpoint = _resolve_checkpoint_path(checkpoint_path)
+        if resolved_checkpoint:
+            if not os.path.exists(resolved_checkpoint):
                 raise FileNotFoundError(
-                    f"SAM3 checkpoint path does not exist: {checkpoint_path}"
+                    f"SAM3 checkpoint path does not exist: {resolved_checkpoint}"
                 )
-            logger.info(f"Using explicit SAM3 checkpoint: {checkpoint_path}")
+            if checkpoint_path:
+                logger.info(f"Using explicit SAM3 checkpoint: {resolved_checkpoint}")
+            elif os.environ.get("CAPX_SAM3_CHECKPOINT_PATH"):
+                logger.info(
+                    "Using SAM3 checkpoint from CAPX_SAM3_CHECKPOINT_PATH: "
+                    f"{resolved_checkpoint}"
+                )
+            else:
+                logger.info(
+                    "Using default shared SAM3 checkpoint: "
+                    f"{resolved_checkpoint}"
+                )
         elif not load_from_hf:
             raise ValueError(
                 "load_from_hf=False requires --checkpoint-path in offline setups"
             )
+        else:
+            logger.warning(
+                "No local SAM3 checkpoint resolved; falling back to HuggingFace download."
+            )
 
         _MODEL = build_sam3_image_model(
             device=device,
-            checkpoint_path=checkpoint_path,
-            load_from_HF=(load_from_hf and checkpoint_path is None),
+            checkpoint_path=resolved_checkpoint,
+            load_from_HF=(load_from_hf and resolved_checkpoint is None),
             enable_inst_interactivity=True,
         )
     except Exception as e:

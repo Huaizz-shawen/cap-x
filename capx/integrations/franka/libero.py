@@ -3,6 +3,7 @@ import pathlib
 import time
 import copy
 import logging
+import os
 from typing import Any
 
 import numpy as np
@@ -85,7 +86,12 @@ class FrankaLiberoApi(ApiBase):
             self.sam3_point_prompt_fn = init_sam3_point_prompt()
         else:
             self.sam2_point_prompt_fn = init_sam2_point_prompt()
-        self.molmo_point_fn = init_molmo()
+        self.disable_molmo = os.getenv("CAPX_DISABLE_MOLMO", "0") == "1"
+        if self.disable_molmo:
+            self.molmo_point_fn = None
+            _LOGGER.warning("Molmo is disabled by CAPX_DISABLE_MOLMO=1")
+        else:
+            self.molmo_point_fn = init_molmo()
         self.grasp_net_plan_fn = init_contact_graspnet()
         # used for multiview grasps
         self.grasp_net_plan_point_clouds_fn = init_contact_graspnet_point_clouds()
@@ -369,6 +375,8 @@ class FrankaLiberoApi(ApiBase):
             dict[str, tuple[int | None, int | None]]: Pixel coordinates for each
             object query; (None, None) if parsing failed.
         """
+        if self.disable_molmo or self.molmo_point_fn is None:
+            raise RuntimeError("Molmo is disabled (CAPX_DISABLE_MOLMO=1)")
         return self.molmo_point_fn(Image.fromarray(image), objects=[text_prompt])
 
     def get_oriented_bounding_box_from_3d_points(self, points: np.ndarray) -> dict[str, Any]:
@@ -705,13 +713,13 @@ class FrankaLiberoApi(ApiBase):
             # SAM3: unified detection + segmentation from text prompt
             results = self.sam3_seg_fn(image, text_prompt=object_name)
             if len(results) == 0:
-                # try molmo if language sam3 fails
-                dets = self.molmo_point_fn(image, objects=[object_name])
-                point = dets.get(object_name)
-                if point is None or any(coord is None for coord in point):
-                    return None, None, None
-                point_coords = (float(point[0]), float(point[1]))
-                results = self.sam3_point_prompt_fn(image, point_coords=point_coords)
+                # Optionally try Molmo-assisted point prompt if enabled.
+                if not self.disable_molmo and self.molmo_point_fn is not None:
+                    dets = self.molmo_point_fn(image, objects=[object_name])
+                    point = dets.get(object_name)
+                    if point is not None and not any(coord is None for coord in point):
+                        point_coords = (float(point[0]), float(point[1]))
+                        results = self.sam3_point_prompt_fn(image, point_coords=point_coords)
             
             if len(results) == 0:
                 return None, None, None
@@ -854,14 +862,15 @@ class FrankaLiberoApi(ApiBase):
             intrinsics = obs[cam_name]["intrinsics"]
             extrinsics = obs[cam_name]["pose_mat"]
             
-            # use Molmo to point prompt
-            points = self.point_prompt_molmo(rgb, text_prompt)
-            point = points[text_prompt]
-            
-            # Get SAM3 segmentations (fall back to text prompt if point prompt yields nothing)
             masks = []
-            if point[0] is not None:
-                masks = self.segment_sam3_point_prompt(rgb, point)
+            # Optional Molmo-assisted point prompt.
+            if not self.disable_molmo and self.molmo_point_fn is not None:
+                points = self.point_prompt_molmo(rgb, text_prompt)
+                point = points[text_prompt]
+                if point[0] is not None:
+                    masks = self.segment_sam3_point_prompt(rgb, point)
+            
+            # Fall back to SAM3 text prompt.
             if not masks:
                 masks = self.segment_sam3_text_prompt(rgb, text_prompt)
             if not masks:

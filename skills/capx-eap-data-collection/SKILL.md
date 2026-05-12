@@ -25,6 +25,7 @@ Do not use this skill for editing policy code inside `cap-x` unless the user is 
 - The `cap-x` repository is available locally.
 - Prefer running from the repo root.
 - The repo should have `.venv` or `.venv-libero` available. This workflow prefers `.venv-libero` when present.
+- `export` / `export-shards` requires `pyarrow` in the active venv. On offline Inspire notebooks, install dependencies from an online notebook that mounts the same shared workspace/venv path.
 - Model-backed collection needs a reachable `--server-url`, `--api-key`, and `--model`.
 - If the repo uses local API bash profiles under `.capx_api/`, prefer `--api-bash-profile` over hardcoding secrets in the command line. For visual-feedback runs, the profile should also set `--visual-differencing-model*` so image differencing does not fall back to `127.0.0.1:8110`. A mixed planner/VDM profile such as `codex_gemini_vdm` is a good default when you want Codex for code generation and Gemini for image understanding.
 - Non-privileged visual configs may also require SAM3, GraspNet, or PyRoKi service setup. For a quick smoke test, prefer privileged LIBERO configs.
@@ -33,9 +34,10 @@ Do not use this skill for editing policy code inside `cap-x` unless the user is 
 
 1. Choose a config and always pass an explicit `--output-dir`.
 2. Run collection through `skills/capx-eap-data-collection/scripts/capx_eap_pipeline.py collect` or `collect-export`.
-3. Export the produced trial outputs through `skills/capx-eap-data-collection/scripts/capx_eap_pipeline.py export`.
-4. Validate the exported LeRobot dataset through `skills/capx-eap-data-collection/scripts/capx_eap_pipeline.py validate`.
-5. Report the collection directory, LeRobot output directory, and dataset size.
+3. Export the produced outputs through `skills/capx-eap-data-collection/scripts/capx_eap_pipeline.py export-shards` (preferred) or `export`.
+4. For storage-constrained runs, add `--cleanup-transition-dataset` after successful shard export.
+5. Validate the exported LeRobot dataset through `skills/capx-eap-data-collection/scripts/capx_eap_pipeline.py validate`.
+6. Report raw run size, transition dataset size, and final LeRobot shard size.
 
 ## Preferred Defaults
 
@@ -47,9 +49,12 @@ Do not use this skill for editing policy code inside `cap-x` unless the user is 
 - Raw artifacts are now organized as `trial_xx/attempt_yy`, so retries and final outputs stay grouped under one trial instead of producing multiple ambiguous flat directories.
 - Exporters skip samples marked `exclude_from_training=true` by default, especially `exclusion_reason=sim_limit_reset`. Use `--include-excluded` only when the user explicitly wants those samples.
 - For training-oriented export, use LeRobot `dtype=video` with H.264 and a moderate `--crf` such as `30`.
+- For lightweight collection targets, enforce `--fps 20` during export and prefer per-attempt shard export so each attempt can be cleaned immediately.
+- Treat `transition_dataset` as an intermediate artifact. Keep it only until the matching LeRobot shard and `manifest.json` are validated.
 - Keep collection outputs and LeRobot outputs separate:
   - raw collection under `outputs/<model>/<run-id>` or another explicit directory
   - exported LeRobot dataset under `outputs/lerobot/<run-id>`
+- On Inspire, if the target notebook has no outbound network, bootstrap missing wheels (for example `pyarrow`) into the shared `.venv` from a network-enabled notebook using the same mounted workspace.
 - Validation uses a writable Hugging Face cache under `/tmp/capx_hf_cache` by default, so it should work even when `~/.cache/huggingface` is read-only.
 - For multi-task collection, prefer `write-manifest` plus `collect-manifest` over modifying `launch.py`.
 - `collect-manifest` now orchestrates one detached child collection job per task and resumes unfinished trials on rerun, so long batches are less vulnerable to single-process failures.
@@ -88,6 +93,25 @@ python skills/capx-eap-data-collection/scripts/capx_eap_pipeline.py export \
   --input-root outputs/gpt-5.3-codex/my_goal_run \
   --output-root outputs/lerobot/my_goal_run \
   --crf 30
+```
+
+Install `pyarrow` into a shared `.venv` from a network-enabled notebook:
+
+```bash
+cd /inspire/hdd/project/exploration-topic/public/zzhuai/cap-x
+uv pip install --python ./.venv/bin/python pyarrow
+```
+
+Per-attempt export with immediate cleanup of transition artifacts:
+
+```bash
+python skills/capx-eap-data-collection/scripts/capx_eap_pipeline.py export-shards \
+  --repo-root /inspire/hdd/project/exploration-topic/public/zzhuai/cap-x \
+  --input-root outputs/gpt-5.3-codex/my_goal_run \
+  --output-root outputs/lerobot_shards/my_goal_run \
+  --fps 20 \
+  --crf 30 \
+  --cleanup-transition-dataset
 ```
 
 If the user explicitly wants to keep simulator-limit resets in the export:

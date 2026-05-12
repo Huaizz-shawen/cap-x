@@ -104,6 +104,34 @@ Detached runs write a log and pid file under:
 
 You can override those paths with `--detached-log-file` and `--detached-pid-file`, and replace a stale detached job with `--detached-replace-existing`.
 
+### Inspire Offline Notebook Export (Shared `.venv` Pattern)
+
+When the target collection notebook cannot reach the internet, use a paired online notebook with the same shared storage mount:
+
+1. On the online notebook, install missing export dependencies into the shared venv:
+
+```bash
+cd /inspire/hdd/project/exploration-topic/public/zzhuai/cap-x
+uv pip install --python ./.venv/bin/python pyarrow
+```
+
+2. Run collection on the target notebook as usual.
+3. Export each attempt as a separate LeRobot shard:
+
+```bash
+python skills/capx-eap-data-collection/scripts/capx_eap_pipeline.py export-shards \
+  --repo-root /inspire/hdd/project/exploration-topic/public/zzhuai/cap-x \
+  --input-root outputs/<model>/<run_id> \
+  --output-root outputs/lerobot_shards/<run_id> \
+  --fps 20 \
+  --crf 30 \
+  --cleanup-transition-dataset
+```
+
+4. Verify each shard has `manifest.json` and then keep only shard outputs.
+
+This keeps storage pressure low by deleting `transition_dataset` immediately after successful export.
+
 ## Output Conventions
 
 Raw collection output:
@@ -118,6 +146,7 @@ Raw collection output:
 LeRobot export output:
 
 - `outputs/lerobot/<run-id>`
+- per-attempt shards can also be stored under `outputs/lerobot_shards/<run-id>/<trial_xx__attempt_yy>`
 
 LeRobot export structure produced by this repo:
 
@@ -146,6 +175,16 @@ By default, exporters skip attempts tagged with:
 - `exclusion_reason = "sim_limit_reset"`
 
 This is intended to keep obviously invalid simulator-reset artifacts out of downstream training. If the user explicitly wants to keep those episodes, pass `--include-excluded`.
+
+## Storage Planning Notes
+
+- Transition datasets are intermediate and can be much larger than final LeRobot shards.
+- In one validated Inspire run:
+  - raw run dir: `11,918,087 KB`
+  - `transition_dataset` subtotal: `11,803,137 KB`
+  - exported LeRobot shard root: `16,912 KB`
+  - reclaimable after `--cleanup-transition-dataset`: about `11.26 GiB`
+- For planning, treat long-term storage as shard size plus logs/metadata, not raw transition payload.
 
 ## Troubleshooting
 

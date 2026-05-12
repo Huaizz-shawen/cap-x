@@ -1,5 +1,6 @@
 from contextlib import nullcontext
 from typing import Any, Callable, Tuple
+import logging
 
 import numpy as np
 from scipy.spatial.transform import Rotation as SciRotation
@@ -9,6 +10,7 @@ from capx.envs.base import (
 )
 from capx.integrations.base_api import ApiBase
 
+_LOGGER = logging.getLogger(__name__)
 
 # ------------------------------- Control API ------------------------------
 class FrankaLiberoPrivilegedApi(ApiBase):
@@ -16,6 +18,21 @@ class FrankaLiberoPrivilegedApi(ApiBase):
     """
 
     _TCP_OFFSET = np.array([0.0, 0.0, -0.1], dtype=np.float64)
+
+    @staticmethod
+    def _extract_arm_joints(cfg: np.ndarray | list[float]) -> np.ndarray:
+        cfg_arr = np.asarray(cfg, dtype=np.float64).reshape(-1)
+        if cfg_arr.size == 8:
+            return cfg_arr[:7]
+        if cfg_arr.size == 7:
+            return cfg_arr
+        if cfg_arr.size > 8:
+            _LOGGER.warning("Unexpected IK cfg size=%d; truncating to first 7 joints", cfg_arr.size)
+            return cfg_arr[:7]
+        if cfg_arr.size == 0:
+            raise ValueError("IK returned empty cfg; cannot extract 7 arm joints")
+        _LOGGER.warning("Unexpected IK cfg size=%d; padding to 7 joints", cfg_arr.size)
+        return np.pad(cfg_arr, (0, 7 - cfg_arr.size), mode="edge")
 
     def _action_context(self, action_name: str, **metadata: Any):
         if hasattr(self._env, "action_context"):
@@ -206,7 +223,7 @@ class FrankaLiberoPrivilegedApi(ApiBase):
                         target_wxyz=quat_wxyz,
                         prev_cfg=self.cfg,
                     )
-                joints_z_offset = np.asarray(self.cfg[:-1], dtype=np.float64).reshape(7)
+                joints_z_offset = self._extract_arm_joints(self.cfg)
 
                 self._env.move_to_joints_blocking(joints_z_offset)
 
@@ -225,7 +242,7 @@ class FrankaLiberoPrivilegedApi(ApiBase):
                     target_wxyz=quat_wxyz,
                     prev_cfg=self.cfg,
                 )
-            joints = np.asarray(self.cfg[:-1], dtype=np.float64).reshape(7)
+            joints = self._extract_arm_joints(self.cfg)
             self._env.move_to_joints_blocking(joints)
 
     def goto_pose_interactive_cartesian(self, target_pose_predicate: Callable[[], Tuple[np.ndarray, np.ndarray]], replan_interval_s: float = 0.0, lin_vel_norm: float = 1.0, ang_vel_norm: float = 2.0, z_approach: float = 0.0, timeout_s: float = 20.0) -> None:
@@ -303,7 +320,7 @@ class FrankaLiberoPrivilegedApi(ApiBase):
                     target_wxyz=current_target_quaternion_wxyz,
                     prev_cfg=self.cfg,
                 )
-                joints = np.asarray(self.cfg[:-1], dtype=np.float64).reshape(7)
+                joints = self._extract_arm_joints(self.cfg)
                 self._env.move_to_joints_blocking(joints, max_steps=1)
             if loop_executed:
                 self._env.move_to_joints_blocking(joints)

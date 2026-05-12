@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import copy
+import hashlib
 import json
 import os
 import random
@@ -162,6 +163,22 @@ def _env_int(name: str, default: int) -> int:
     return parsed
 
 
+def _env_float_list(name: str, default: list[float]) -> list[float]:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    parsed: list[float] = []
+    for token in value.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            parsed.append(float(token))
+        except ValueError:
+            return default
+    return parsed if parsed else default
+
+
 def _load_request_retry_config() -> RequestRetryConfig:
     return RequestRetryConfig(
         request_timeout_s=_env_float("CAPX_MODEL_REQUEST_TIMEOUT_S", DEFAULT_REQUEST_TIMEOUT_S),
@@ -192,6 +209,95 @@ def _is_retryable_exception(exc: requests.RequestException) -> bool:
 
 def _is_retryable_status_code(status_code: int) -> bool:
     return status_code in RETRYABLE_STATUS_CODES
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _payload_structure_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return a sanitized, structural summary for a model payload.
+
+    The summary intentionally avoids logging raw prompt text or API keys.
+    """
+    compact = json.dumps(payload, separators=(",", ":"), ensure_ascii=False, default=str)
+    summary: dict[str, Any] = {
+        "model": payload.get("model"),
+        "top_keys": sorted(payload.keys()),
+        "payload_bytes": len(compact.encode("utf-8")),
+        "payload_sha256_16": hashlib.sha256(compact.encode("utf-8")).hexdigest()[:16],
+    }
+
+    def collect_content_stats(items: list[Any], stats: dict[str, Any]) -> None:
+        for item in items:
+            if isinstance(item, str):
+                stats["string_items"] += 1
+                if stats["first_text_len"] is None and item:
+                    stats["first_text_len"] = len(item)
+                continue
+            if not isinstance(item, dict):
+                stats["other_items"] += 1
+                continue
+            item_type = item.get("type")
+            if isinstance(item_type, str):
+                stats["content_type_counts"][item_type] = stats["content_type_counts"].get(item_type, 0) + 1
+                if item_type in {"image_url", "input_image"}:
+                    stats["image_items"] += 1
+            if stats["first_text_len"] is None:
+                txt = item.get("text")
+                if not isinstance(txt, str):
+                    txt = item.get("input_text")
+                if isinstance(txt, str) and txt:
+                    stats["first_text_len"] = len(txt)
+
+    if isinstance(payload.get("messages"), list):
+        messages = payload["messages"]
+        stats: dict[str, Any] = {
+            "messages_count": len(messages),
+            "content_items_count": 0,
+            "content_type_counts": {},
+            "image_items": 0,
+            "string_items": 0,
+            "other_items": 0,
+            "first_text_len": None,
+        }
+        for msg in messages:
+            content = msg.get("content") if isinstance(msg, dict) else None
+            if isinstance(content, list):
+                stats["content_items_count"] += len(content)
+                collect_content_stats(content, stats)
+            elif isinstance(content, str):
+                stats["string_items"] += 1
+                if stats["first_text_len"] is None and content:
+                    stats["first_text_len"] = len(content)
+        summary["messages"] = stats
+
+    if isinstance(payload.get("input"), list):
+        input_items = payload["input"]
+        stats = {
+            "input_items_count": len(input_items),
+            "content_items_count": 0,
+            "content_type_counts": {},
+            "image_items": 0,
+            "string_items": 0,
+            "other_items": 0,
+            "first_text_len": None,
+        }
+        for item in input_items:
+            content = item.get("content") if isinstance(item, dict) else None
+            if isinstance(content, list):
+                stats["content_items_count"] += len(content)
+                collect_content_stats(content, stats)
+            elif isinstance(content, str):
+                stats["string_items"] += 1
+                if stats["first_text_len"] is None and content:
+                    stats["first_text_len"] = len(content)
+        summary["input"] = stats
+
+    return summary
 
 
 def collapse_text_image_inputs(messages: list[dict]) -> list[dict]:
@@ -336,6 +442,13 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
         headers["Authorization"] = f"Bearer {args.api_key}"
     elif os.getenv("OPENAI_API_KEY") is not None and args.model in GPT_MODELS:
         headers["Authorization"] = f"Bearer {os.getenv('OPENAI_API_KEY')}"
+    log_payload_summary = _env_flag("CAPX_LOG_PLANNER_PAYLOAD_SUMMARY", False)
+    payload_summary = _payload_structure_summary(payload)
+    if log_payload_summary:
+        print(
+            "[PlannerPayloadSummary] "
+            f"server_url={server_url} summary={json.dumps(payload_summary, ensure_ascii=False)}"
+        )
     start_time = time.time()
     retry_config = _load_request_retry_config()
     response = None
@@ -350,6 +463,12 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
                 timeout=(30, retry_config.request_timeout_s),
             )
             if _is_retryable_status_code(response.status_code):
+                if log_payload_summary:
+                    body_head = (response.text or "")[:300].replace("\n", "\\n")
+                    print(
+                        "[PlannerPayloadError] "
+                        f"attempt={attempt} status={response.status_code} body_head={body_head!r}"
+                    )
                 last_error = requests.HTTPError(
                     f"Model query failed with status code {response.status_code}",
                     response=response,
@@ -358,6 +477,11 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
                 response.raise_for_status()
                 break
         except requests.RequestException as exc:
+            if log_payload_summary:
+                print(
+                    "[PlannerPayloadError] "
+                    f"attempt={attempt} exception={type(exc).__name__} detail={str(exc)[:300]!r}"
+                )
             if not _is_retryable_exception(exc):
                 raise
             last_error = exc
@@ -752,10 +876,15 @@ def query_single_model_ensemble(
             print(f"[Single Model Ensemble] {model} temp={temp} FAILED: {error_msg}")
             return {"model": model, "temp": temp, "content": error_msg, "ok": False}
 
-    # Query same model with 9 different temperatures (0.1 to 0.9)
-    temperatures = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+    # Query same model with configurable temperatures.
+    # Default keeps legacy behavior (9 candidates), while CAPX_SINGLE_MODEL_ENSEMBLE_TEMPS
+    # lets us run lighter 2-3 candidate ensembles without code changes.
+    temperatures = _env_float_list(
+        "CAPX_SINGLE_MODEL_ENSEMBLE_TEMPS",
+        [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
+    )
     responses = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=9) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(temperatures))) as executor:
         futures = {executor.submit(query_single, t): t for t in temperatures}
         for future in concurrent.futures.as_completed(futures):
             resp = future.result()

@@ -37,7 +37,7 @@ from capx.utils.parallel_eval import run_parallel_with_setup
 # Constants
 # ---------------------------------------------------------------------------
 
-TRIAL_TIMEOUT_SECONDS = 1000
+TRIAL_TIMEOUT_SECONDS = int(os.environ.get("CAPX_TRIAL_TIMEOUT_SECONDS", "1000"))
 MAX_TRIAL_RETRIES = 3
 
 

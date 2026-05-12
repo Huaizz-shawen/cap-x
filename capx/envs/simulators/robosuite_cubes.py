@@ -12,8 +12,8 @@ from typing import Any
 import numpy as np
 import robosuite as suite
 import viser.transforms as vtf
-from robosuite.controllers.composite.composite_controller_factory import (
-    load_composite_controller_config,
+from capx.envs.simulators.robosuite_controller_compat import (
+    load_controller_config_compat,
 )
 from robosuite.utils.placement_samplers import UniformRandomSampler
 
@@ -62,7 +62,7 @@ class FrankaRobosuiteCubesLowLevel(RobosuiteBaseEnv):
                     reward_shaping=True,
                     camera_heights=self._render_height,
                     camera_widths=self._render_width,
-                    controller_configs=load_composite_controller_config(
+                    controller_configs=load_controller_config_compat(
                         controller=self.controller_cfg
                     ),
                     horizon=max_steps,
@@ -77,7 +77,7 @@ class FrankaRobosuiteCubesLowLevel(RobosuiteBaseEnv):
                     renderer="mujoco",
                     camera_heights=self._render_height,
                     camera_widths=self._render_width,
-                    controller_configs=load_composite_controller_config(
+                    controller_configs=load_controller_config_compat(
                         controller=self.controller_cfg
                     ),
                     horizon=max_steps,
@@ -94,7 +94,7 @@ class FrankaRobosuiteCubesLowLevel(RobosuiteBaseEnv):
                 renderer="mujoco",
                 camera_heights=self._render_height,
                 camera_widths=self._render_width,
-                controller_configs=load_composite_controller_config(controller=self.controller_cfg),
+                controller_configs=load_controller_config_compat(controller=self.controller_cfg),
                 horizon=max_steps,
                 reward_shaping=True,
             )

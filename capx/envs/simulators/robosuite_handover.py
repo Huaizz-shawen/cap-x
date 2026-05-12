@@ -17,8 +17,8 @@ import viser
 # Temporary viser debugging imports
 import viser.extras
 import viser.transforms as vtf
-from robosuite.controllers.composite.composite_controller_factory import (
-    load_composite_controller_config,
+from capx.envs.simulators.robosuite_controller_compat import (
+    load_controller_config_compat,
 )
 from robosuite.utils.camera_utils import get_real_depth_map
 from robot_descriptions.loaders.yourdfpy import load_robot_description
@@ -53,7 +53,7 @@ class RobosuiteHandoverEnv(BaseEnv):
 
         # TwoArmHandover requires 2 robots or 1 bimanual robot
         # Load controller config for both robots (same config for both)
-        controller_config = load_composite_controller_config(controller=self.controller_cfg)
+        controller_config = load_controller_config_compat(controller=self.controller_cfg)
         
         # Initialize Robosuite environment
         if privileged:
