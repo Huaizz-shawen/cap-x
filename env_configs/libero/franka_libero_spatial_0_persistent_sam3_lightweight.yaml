@@ -19,6 +19,10 @@ env:
       transition_include_segmentation: false
       transition_record_hz: 20
       transition_export_only: true
+      # Optional diversification for transition collection:
+      # randomize initial arm joints around reset pose (radians).
+      randomize_initial_arm_joints: false
+      randomize_initial_arm_joint_delta: 0.08
     privileged: false
     apis:
       - FrankaLiberoApi

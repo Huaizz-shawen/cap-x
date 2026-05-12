@@ -42,6 +42,8 @@ class FrankaLiberoEnv(BaseEnv):
         record_transition_depth: bool = True,
         record_transition_step_metadata: bool = True,
         record_transition_fps: float | None = 20.0,
+        randomize_initial_arm_joints: bool = False,
+        randomize_initial_arm_joint_delta: float = 0.08,
     ) -> None:
         self._post_success_step_budget_default = 240
         super().__init__()
@@ -64,6 +66,8 @@ class FrankaLiberoEnv(BaseEnv):
             if self._record_transition_fps is None
             else 1.0 / self._record_transition_fps
         )
+        self._randomize_initial_arm_joints = bool(randomize_initial_arm_joints)
+        self._randomize_initial_arm_joint_delta = float(max(0.0, randomize_initial_arm_joint_delta))
 
         self.handle = load_libero_task(
             suite_name=suite_name,
@@ -121,12 +125,29 @@ class FrankaLiberoEnv(BaseEnv):
         # Precompute fast joint qpos addresses for Panda (avoid heavy _get_observations in tight loops)
         joint_names = [f"robot0_joint{i}" for i in range(1, 8)]
         self._panda_joint_qpos_addrs: list[int] = []
+        self._panda_joint_qvel_addrs: list[int] = []
+        self._panda_joint_lower_limits = np.full(7, -np.inf, dtype=np.float64)
+        self._panda_joint_upper_limits = np.full(7, np.inf, dtype=np.float64)
         for jn in joint_names:
             addr = self.handle.env.sim.model.get_joint_qpos_addr(jn)
             # All Panda joints are 1-DoF; addr should be an int
             if isinstance(addr, tuple):
                 addr = addr[0]
             self._panda_joint_qpos_addrs.append(int(addr))
+
+            qvel_addr = self.handle.env.sim.model.get_joint_qvel_addr(jn)
+            if isinstance(qvel_addr, tuple):
+                qvel_addr = qvel_addr[0]
+            self._panda_joint_qvel_addrs.append(int(qvel_addr))
+
+            joint_id = self.handle.env.sim.model.joint_name2id(jn)
+            joint_range = self.handle.env.sim.model.jnt_range[joint_id]
+            self._panda_joint_lower_limits[len(self._panda_joint_qpos_addrs) - 1] = float(
+                joint_range[0]
+            )
+            self._panda_joint_upper_limits[len(self._panda_joint_qpos_addrs) - 1] = float(
+                joint_range[1]
+            )
 
         self.home_joint_position: np.ndarray | None = None
 
@@ -179,6 +200,14 @@ class FrankaLiberoEnv(BaseEnv):
                 libero_obs = self.handle.env.reset()
                 libero_info = {}
 
+        if self._randomize_initial_arm_joints:
+            randomized_joints = self._sample_randomized_initial_joints(
+                np.array(libero_obs["robot0_joint_pos"], dtype=np.float64)
+            )
+            self._set_robot_joints_in_sim(randomized_joints)
+            if hasattr(self.handle.env, "_get_observations"):
+                libero_obs = self.handle.env._get_observations()
+
         self._current_obs = libero_obs
         self._current_info = libero_info
 
@@ -217,6 +246,33 @@ class FrankaLiberoEnv(BaseEnv):
 
         info = {"task_prompt": self.handle.task_language}
         return obs, info
+
+    def _sample_randomized_initial_joints(self, nominal_joints: np.ndarray) -> np.ndarray:
+        """Sample randomized initial arm joints around nominal reset pose."""
+        nominal = np.asarray(nominal_joints, dtype=np.float64).reshape(7)
+        if self._randomize_initial_arm_joint_delta <= 0.0:
+            return nominal.copy()
+        noise = self._rng.uniform(
+            low=-self._randomize_initial_arm_joint_delta,
+            high=self._randomize_initial_arm_joint_delta,
+            size=7,
+        )
+        randomized = nominal + noise
+        return np.clip(
+            randomized,
+            self._panda_joint_lower_limits,
+            self._panda_joint_upper_limits,
+        )
+
+    def _set_robot_joints_in_sim(self, joints: np.ndarray) -> None:
+        """Directly set Panda joints in MuJoCo sim and refresh kinematics."""
+        target = np.asarray(joints, dtype=np.float64).reshape(7)
+        sim = self.handle.env.sim
+        for idx, qpos_addr in enumerate(self._panda_joint_qpos_addrs):
+            sim.data.qpos[qpos_addr] = target[idx]
+        for qvel_addr in self._panda_joint_qvel_addrs:
+            sim.data.qvel[qvel_addr] = 0.0
+        sim.forward()
 
     def step(self, action: Any) -> tuple[dict[str, Any], float, bool, bool, dict[str, Any]]:
         """Low-level step - not typically called directly in code execution mode."""
