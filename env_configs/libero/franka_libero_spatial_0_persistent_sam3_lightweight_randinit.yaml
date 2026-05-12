@@ -1,0 +1,71 @@
+# LIBERO Spatial Task 0 with persistent external SAM3 service + lightweight transition storage.
+# Differences from franka_libero_spatial_0_persistent_sam3.yaml:
+# - Keep SAM3 external via CAPX_SAM3_SERVICE_URL.
+# - Store compact transition data (RGB only, no depth/segmentation/environment state).
+# - Explicitly keep transition sampling at 20Hz.
+
+env:
+  _target_: capx.envs.tasks.franka.franka_libero_env.FrankaLiberoCodeEnv
+  cfg:
+    _target_: capx.envs.tasks.base.CodeExecEnvConfig
+    low_level:
+      _target_: capx.envs.simulators.libero.FrankaLiberoEnv
+      suite_name: libero_spatial
+      task_id: 0
+      max_steps: 8000
+      control_freq: 20
+      transition_low_level_mode: rgb_only
+      transition_include_depth: false
+      transition_include_segmentation: false
+      transition_record_hz: 20
+      transition_export_only: true
+      # Optional diversification for transition collection:
+      # randomize initial arm joints around reset pose (radians).
+      randomize_initial_arm_joints: true
+      randomize_initial_arm_joint_delta: 0.08
+    privileged: false
+    apis:
+      - FrankaLiberoApi
+    prompt: |
+      You are controlling a Franka Emika robot with API described below.
+      Goal: {libero_environment_goal}
+      When the goal names an object using attributes, state, or spatial relations, you must preserve that full discriminative phrase when calling perception and grasp APIs. Do not simplify "the black bowl between the plate and the ramekin" to "bowl".
+      When placing an object on a receptacle such as a plate, prefer `place_on_object_center(...)` over manually placing at `target_pos + offset`. LIBERO success requires the released object to be close to the receptacle center in XY. For bowls on plates, prefer the helper's default top-down placement orientation instead of reusing a tilted grasp quaternion.
+      You may write python code comments for reasoning but ONLY write the executable Python code and do not write it in code fences.
+      After this code executes, you will be able to get a new observation of the environment and write new code to complete the task if needed.
+      The functions (APIs) below are already imported to the environment. If you want to use numpy, you need to import it explicitly.
+
+    multi_turn_prompt: |
+      The following code blocks were just executed:
+      ```python
+      {executed_code}
+      ```
+      The current console stdout is:
+      ```
+      {console_stdout}
+      ```
+      The current console stderr is:
+      ```
+      {console_stderr}
+      ```
+      If there were no errors during compilation or execution, the console stderr will be empty. If there were errors, consider regenerating the code.
+      Please respond with EXACTLY ONE of the following:
+      - The word 'REGENERATE' followed immediately by new Python code in a fenced code block (```python...```) if you want to modify the code.
+      - The word 'FINISH' if the task appears to be complete
+
+api_servers:
+  - _target_: capx.serving.launch_pyroki_server.main
+    port: 8116
+    host: 127.0.0.1
+    robot: panda_description
+    target_link: panda_hand
+
+  - _target_: capx.serving.launch_contact_graspnet_server.main
+    port: 8115
+    host: 127.0.0.1
+
+record_video: true
+output_dir: ./outputs/franka_libero_spatial_0
+
+trials: 50
+num_workers: 10

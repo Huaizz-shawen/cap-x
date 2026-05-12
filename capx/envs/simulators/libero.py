@@ -42,6 +42,12 @@ class FrankaLiberoEnv(BaseEnv):
         record_transition_depth: bool = True,
         record_transition_step_metadata: bool = True,
         record_transition_fps: float | None = 20.0,
+        # Backward-compatible transition args from older configs.
+        transition_low_level_mode: str | None = None,
+        transition_include_depth: bool | None = None,
+        transition_include_segmentation: bool | None = None,
+        transition_record_hz: float | None = None,
+        transition_export_only: bool | None = None,
         randomize_initial_arm_joints: bool = False,
         randomize_initial_arm_joint_delta: float = 0.08,
     ) -> None:
@@ -54,6 +60,21 @@ class FrankaLiberoEnv(BaseEnv):
         self.segmentation_level = "instance"
         self._render_width = 800
         self._render_height = 512
+
+        # Compatibility bridge for previous transition_* config keys.
+        if transition_include_depth is not None:
+            record_transition_depth = bool(transition_include_depth)
+        if transition_record_hz is not None:
+            record_transition_fps = float(transition_record_hz)
+        if transition_export_only:
+            # Export-only mode keeps minimal transition metadata.
+            record_transition_step_metadata = False
+        # transition_low_level_mode / transition_include_segmentation are accepted
+        # for config compatibility; current LIBERO transition pipeline does not
+        # branch behavior on these keys in this simulator wrapper.
+        _ = transition_low_level_mode
+        _ = transition_include_segmentation
+
         self._record_transition_depth = record_transition_depth
         self._record_transition_step_metadata = record_transition_step_metadata
         self._record_transition_fps = (
