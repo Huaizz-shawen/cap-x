@@ -1,0 +1,37 @@
+# Smoke config for GR1 Fourier hands on RoboCasa PnPPouring.
+# PnPPouring uses GR1-scoped camera names, unlike some older tabletop tasks.
+
+env:
+  _target_: capx.envs.tasks.gr1.robocasa.GR1RobocasaCodeEnv
+  cfg:
+    _target_: capx.envs.tasks.base.CodeExecEnvConfig
+    low_level:
+      _target_: capx.envs.simulators.robocasa_gr1.GR1RobocasaLowLevel
+      env_name: PnPPouring
+      robots: GR1ArmsOnlyFourierHands
+      controller_config: WHOLE_BODY_MINK_IK
+      camera_names:
+        - egoview
+        - robot0_agentview_center
+      render_camera: egoview
+      camera_widths: 320
+      camera_heights: 240
+      camera_fovy_overrides:
+        egoview: 100
+      max_steps: 400
+      seed: 0
+      record_transition_fps: 20.0
+      record_transition_depth: false
+    privileged: false
+    apis:
+      - GR1RobocasaControlApi
+
+api_servers: []
+record_video: true
+use_visual_feedback: false
+use_img_differencing: true
+use_wrist_camera: true
+output_dir: ./outputs/robocasa_gr1_pnp_pouring_smoke
+trials: 1
+resume_idx: 1
+num_workers: 1

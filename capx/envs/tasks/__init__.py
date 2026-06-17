@@ -185,3 +185,17 @@ register_config(
         apis=["R1ProControlApi"],
     ),
 )
+
+try:
+    from .gr1.robocasa import GR1RobocasaCodeEnv
+
+    register_exec_env("gr1_robocasa_code_env", GR1RobocasaCodeEnv)
+    register_config(
+        "gr1_robocasa_code_env",
+        CodeExecEnvConfig(
+            low_level="gr1_robocasa_low_level",
+            apis=["GR1RobocasaControlApi"],
+        ),
+    )
+except Exception:
+    print("GR1 RoboCasa code env not installed!")

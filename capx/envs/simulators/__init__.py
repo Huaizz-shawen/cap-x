@@ -2,11 +2,12 @@
 from capx.envs.base import list_envs, register_env
 
 
-from .franka_real import FrankaRealLowLevel
-register_env("franka_real_low_level", FrankaRealLowLevel)
+try:
+    from .franka_real import FrankaRealLowLevel
 
-from .widowx_real import WidowXRealLowLevel
-register_env("widowx_real_low_level", WidowXRealLowLevel)
+    register_env("franka_real_low_level", FrankaRealLowLevel)
+except Exception:
+    print("Franka real env not installed!")
 
 # NOTE: Can only have one of Robosuite or LIBERO installed at a time!
 # Using Robosuite run: uv sync --extra robosuite
@@ -71,3 +72,9 @@ except Exception:
     # import traceback
     print("R1Pro not installed!")
     # traceback.print_exc()
+
+try:
+    from .robocasa_gr1 import GR1RobocasaLowLevel
+    register_env("gr1_robocasa_low_level", GR1RobocasaLowLevel)
+except Exception:
+    print("RoboCasa GR1 not installed!")

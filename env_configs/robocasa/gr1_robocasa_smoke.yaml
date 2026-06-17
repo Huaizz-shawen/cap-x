@@ -1,0 +1,36 @@
+# Usage:
+#   uv run --no-sync --active capx/envs/launch.py \
+#     --config-path env_configs/robocasa/gr1_robocasa_smoke.yaml \
+#     --api-bash-profile provider_deepseek_vdm_tunnel \
+#     --total-trials 1
+
+env:
+  _target_: capx.envs.tasks.gr1.robocasa.GR1RobocasaCodeEnv
+  cfg:
+    _target_: capx.envs.tasks.base.CodeExecEnvConfig
+    low_level:
+      _target_: capx.envs.simulators.robocasa_gr1.GR1RobocasaLowLevel
+      # Minimal registered GR1 robosuite task in the RoboCasa GR1 tabletop package.
+      env_name: TwoArmTransport
+      robots: GR1ArmsOnlyFourierHands
+      camera_names:
+        - robot0_eye_in_left_hand
+        - robot0_eye_in_right_hand
+      camera_widths: 224
+      camera_heights: 224
+      max_steps: 300
+      seed: 0
+      record_transition_fps: 20.0
+      record_transition_depth: false
+    privileged: false
+    apis:
+      - GR1RobocasaControlApi
+
+api_servers: []
+
+record_video: true
+output_dir: ./outputs/robocasa_gr1_smoke
+
+trials: 1
+resume_idx: 1
+num_workers: 1

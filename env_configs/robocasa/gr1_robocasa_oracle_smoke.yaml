@@ -1,0 +1,39 @@
+# Minimal launcher-level smoke for RoboCasa + Fourier GR1.
+# This uses oracle_code so it validates CaP-X launch/trial/artifact plumbing
+# without depending on a coding model to solve the task.
+
+env:
+  _target_: capx.envs.tasks.gr1.robocasa.GR1RobocasaCodeEnv
+  cfg:
+    _target_: capx.envs.tasks.base.CodeExecEnvConfig
+    low_level:
+      _target_: capx.envs.simulators.robocasa_gr1.GR1RobocasaLowLevel
+      env_name: TwoArmTransport
+      robots: GR1ArmsOnlyFourierHands
+      camera_names:
+        - robot0_eye_in_left_hand
+        - robot0_eye_in_right_hand
+      camera_widths: 224
+      camera_heights: 224
+      max_steps: 20
+      seed: 0
+      record_transition_fps: 20.0
+      record_transition_depth: false
+    privileged: false
+    apis:
+      - GR1RobocasaControlApi
+    oracle_code: |
+      import numpy as np
+
+      for _ in range(2):
+          env.step(np.zeros(env.sample_action().shape, dtype=np.float32))
+
+api_servers: []
+
+record_video: true
+output_dir: ./outputs/robocasa_gr1_oracle_smoke
+
+trials: 1
+resume_idx: 1
+num_workers: 1
+use_oracle_code: true

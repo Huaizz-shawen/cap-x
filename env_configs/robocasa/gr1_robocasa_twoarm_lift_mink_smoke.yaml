@@ -1,0 +1,33 @@
+# Smoke config for GR1 Fourier hands on RoboSuite TwoArmLift.
+# This task keeps the pot handles near the GR1 reachable workspace, unlike
+# TwoArmTransport's default payload placement.
+
+env:
+  _target_: capx.envs.tasks.gr1.robocasa.GR1RobocasaCodeEnv
+  cfg:
+    _target_: capx.envs.tasks.base.CodeExecEnvConfig
+    low_level:
+      _target_: capx.envs.simulators.robocasa_gr1.GR1RobocasaLowLevel
+      env_name: TwoArmLift
+      robots: GR1ArmsOnlyFourierHands
+      controller_config: WHOLE_BODY_MINK_IK
+      camera_names:
+        - frontview
+        - sideview
+      render_camera: frontview
+      camera_widths: 224
+      camera_heights: 224
+      max_steps: 400
+      seed: 0
+      record_transition_fps: 20.0
+      record_transition_depth: false
+    privileged: false
+    apis:
+      - GR1RobocasaControlApi
+
+api_servers: []
+record_video: true
+output_dir: ./outputs/robocasa_gr1_twoarm_lift_smoke
+trials: 1
+resume_idx: 1
+num_workers: 1

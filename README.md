@@ -53,6 +53,13 @@ The current recovery stack in simulation supports:
 
 This is intended for automated dataset production for downstream policy, VLA, or world-action-model training, not only for benchmark reporting.
 
+For the current RoboCasa GR1 PnPPouring scripted baseline, including the
+validated default candidate, limitations, and robustness roadmap, see
+[docs/robocasa-gr1-pnp-pouring.md](docs/robocasa-gr1-pnp-pouring.md).
+For the broader reusable RoboCasa GR1 skill-library plan across PnPPouring,
+TwoArmLift, and Drawer, see
+[docs/robocasa-gr1-skill-library.md](docs/robocasa-gr1-skill-library.md).
+
 For agent-facing orchestration, a repository-local skill is included under [skills/capx-eap-data-collection](/media/user/B29202FA9202C2B91/cap-x/skills/capx-eap-data-collection). To install repository skills onto a new device, use [sync_repo_skills.sh](/media/user/B29202FA9202C2B91/cap-x/scripts/sync_repo_skills.sh):
 
 ```bash
