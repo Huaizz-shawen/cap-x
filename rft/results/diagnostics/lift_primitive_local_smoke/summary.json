@@ -1,0 +1,25 @@
+{
+  "seed": 60000,
+  "num_cases": 2,
+  "success_count": 1,
+  "best_by_z_delta": [
+    {
+      "name": "q_0010_tcp_neg_dz+0.000",
+      "terminated": true,
+      "reward": 1.0,
+      "cube_world_z_delta": 0.40235575344872987,
+      "cube_height_margin": 0.422004921048138,
+      "min_eef_to_cube": 0.008984709176671818,
+      "error": ""
+    },
+    {
+      "name": "q_0010_tcp_neg_dz+0.025",
+      "terminated": false,
+      "reward": 0.5005906942606858,
+      "cube_world_z_delta": 0.0013824781387627993,
+      "cube_height_margin": 0.020023627770427432,
+      "min_eef_to_cube": 0.03290467170300286,
+      "error": ""
+    }
+  ]
+}

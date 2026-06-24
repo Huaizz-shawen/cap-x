@@ -1,0 +1,15 @@
+{
+  "records": "data/teacher_lift_codex_gemini_vdm_large_0621/scored_local_strict_0622/records.jsonl",
+  "summary": "data/teacher_lift_codex_gemini_vdm_large_0621/scored_local_strict_0622/summary.json",
+  "output": "data/sft_lift_teacher_codex_gemini_vdm_large_0621/train_all_success_strict_0622.jsonl",
+  "input_records": 2048,
+  "num_examples": 2048,
+  "unique_completion_count": 97,
+  "dedup": false,
+  "skipped": {
+    "not_success": 0,
+    "empty": 0,
+    "duplicate": 0
+  },
+  "max_examples": 0
+}

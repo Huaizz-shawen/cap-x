@@ -1,0 +1,13 @@
+{
+  "records": "data/teacher_lift_codex_gemini_vdm_pilot_0621/scored_local/records.jsonl",
+  "summary": "data/teacher_lift_codex_gemini_vdm_pilot_0621/scored_local/summary.json",
+  "output": "data/sft_lift_teacher_codex_gemini_vdm_pilot_0621/train.jsonl",
+  "input_records": 128,
+  "num_examples": 27,
+  "skipped": {
+    "not_success": 0,
+    "empty": 0,
+    "duplicate": 101
+  },
+  "max_examples": 0
+}

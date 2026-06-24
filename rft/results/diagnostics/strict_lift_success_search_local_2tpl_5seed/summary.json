@@ -1,0 +1,25 @@
+{
+  "data_source": "franka_lift_code_env",
+  "seed_base": 60000,
+  "num_seeds": 5,
+  "num_templates": 2,
+  "num_records": 10,
+  "success_count": 10,
+  "success_rate": 1.0,
+  "max_raw_reward": 1.0,
+  "max_delta_cube_z": 0.41568311041575623,
+  "by_template": {
+    "strict_home_single_hold_approach0.08_lift0.45": {
+      "num_records": 5,
+      "success_count": 5,
+      "max_raw_reward": 1.0,
+      "max_delta_cube_z": 0.4102664690796505
+    },
+    "strict_nohome_single_hold_approach0.08_lift0.45": {
+      "num_records": 5,
+      "success_count": 5,
+      "max_raw_reward": 1.0,
+      "max_delta_cube_z": 0.41568311041575623
+    }
+  }
+}

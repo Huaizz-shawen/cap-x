@@ -1,0 +1,61 @@
+{
+  "seed": 60000,
+  "num_cases": 6,
+  "success_count": 4,
+  "best_by_z_delta": [
+    {
+      "name": "home_q_0010_tcp_neg_dz+0.000",
+      "terminated": true,
+      "reward": 1.0,
+      "cube_world_z_delta": 0.40618440745879847,
+      "cube_height_margin": 0.4260701145934962,
+      "min_eef_to_cube": 0.009209337645627797,
+      "error": ""
+    },
+    {
+      "name": "nohome_q_0010_tcp_neg_dz+0.000",
+      "terminated": true,
+      "reward": 1.0,
+      "cube_world_z_delta": 0.4038324866041445,
+      "cube_height_margin": 0.42251904818445873,
+      "min_eef_to_cube": 0.008950878859824546,
+      "error": ""
+    },
+    {
+      "name": "home_q_0010_tcp_neg_dz-0.025",
+      "terminated": true,
+      "reward": 1.0,
+      "cube_world_z_delta": 0.3786707798085207,
+      "cube_height_margin": 0.399007517665779,
+      "min_eef_to_cube": 0.009639897024809179,
+      "error": ""
+    },
+    {
+      "name": "nohome_q_0010_tcp_neg_dz-0.025",
+      "terminated": true,
+      "reward": 1.0,
+      "cube_world_z_delta": 0.36819465549120933,
+      "cube_height_margin": 0.3879990986785973,
+      "min_eef_to_cube": 0.009455280694081487,
+      "error": ""
+    },
+    {
+      "name": "home_q_0010_tcp_neg_dz+0.025",
+      "terminated": false,
+      "reward": 0.5149000064518988,
+      "cube_world_z_delta": 0.0013824855675992342,
+      "cube_height_margin": 0.020596000258075953,
+      "min_eef_to_cube": 0.0329547544343399,
+      "error": ""
+    },
+    {
+      "name": "nohome_q_0010_tcp_neg_dz+0.025",
+      "terminated": false,
+      "reward": 0.502464171666181,
+      "cube_world_z_delta": 0.0013824794477080848,
+      "cube_height_margin": 0.02009856686664724,
+      "min_eef_to_cube": 0.03271565109225795,
+      "error": ""
+    }
+  ]
+}

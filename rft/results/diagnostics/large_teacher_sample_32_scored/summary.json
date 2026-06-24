@@ -1,0 +1,73 @@
+{
+  "label": "large_teacher_sample32",
+  "model_path": "gpt-5.5",
+  "data_source": "franka_lift_code_env",
+  "num_trials": 9,
+  "samples_per_seed": 4,
+  "num_records": 32,
+  "success_count": 32,
+  "success_rate": 1.0,
+  "pass_at_k_success_count": 9,
+  "pass_at_k_success_rate": 1.0,
+  "valid_execution_count": 32,
+  "valid_execution_rate": 1.0,
+  "mean_score": 1.0,
+  "error_buckets": {
+    "none": 32
+  },
+  "seeds": [
+    71000,
+    71001,
+    71002,
+    71003,
+    71004,
+    71005,
+    71006,
+    71007,
+    71008
+  ],
+  "generation": [
+    {
+      "max_tokens": 256,
+      "temperature": 0.8,
+      "top_p": 0.95,
+      "send_seed": false
+    },
+    {
+      "max_tokens": 256,
+      "temperature": 0.8,
+      "top_p": 0.95,
+      "send_seed": false
+    },
+    {
+      "max_tokens": 256,
+      "temperature": 0.8,
+      "top_p": 0.95,
+      "send_seed": false
+    },
+    {
+      "max_tokens": 256,
+      "temperature": 0.8,
+      "top_p": 0.95,
+      "send_seed": false
+    },
+    {
+      "max_tokens": 256,
+      "temperature": 0.8,
+      "top_p": 0.95,
+      "send_seed": false
+    }
+  ],
+  "prompt_sha256": "7374a8811836c3a40f28a8919645de4b7d25f52e67095a9454906bfcb18b4c26",
+  "prompt_messages": [
+    {
+      "role": "system",
+      "content": "You are a helpful assistant that generates Python code to directly solve the task."
+    },
+    {
+      "role": "user",
+      "content": "\nYou are controlling a Franka Emika robot with API described below.\nGoal: pick up the red cube and lift it.\nYou may write python code comments for reasoning but ONLY write the executable Python code and do not write it in code fences.\nThe functions (APIs) below are already imported to the environment. If you want to use numpy, you need to import it explicitly.\n\nAPIs:\n\nget_object_pose(object_name: str, return_bbox_extent: bool = False) -> tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray | None]\n  Doc:\n    Get the pose of an object in the environment from a natural language description.\n    The quaternion from get_object_pose may be unreliable, so disregard it and use the grasp pose quaternion OR (0, 0, 1, 0) wxyz as the gripper down orientation if using this for placement position.\n    \n    Args:\n        object_name: The name of the object to get the pose of.\n    \n    Returns:\n        position: (3,) XYZ in meters.\n        quaternion_wxyz: (4,) WXYZ unit quaternion.\n        bbox_extent: (3,) object extent in meters of x, y, z axes respectively in the world frame (full side length, not half-length extent). If return_bbox_extent is False, returns None.\n\nsample_grasp_pose(object_name: str) -> tuple[numpy.ndarray, numpy.ndarray]\n  Doc:\n    Sample a grasp pose for an object in the environment from a natural language description.\n    Do use the grasp sample quaternion from sample_grasp_pose.\n    \n    Args:\n        object_name: The name of the object to sample a grasp pose for.\n    \n    Returns:\n        position: (3,) XYZ in meters.\n        quaternion_wxyz: (4,) WXYZ unit quaternion.\n\ngoto_pose(position: numpy.ndarray, quaternion_wxyz: numpy.ndarray, z_approach: float = 0.0) -> None\n  Doc:\n    Go to pose using Inverse Kinematics.\n    There is no need to call a second goto_pose with the same position and quaternion_wxyz after calling it with z_approach.\n    Args:\n        position: (3,) XYZ in meters.\n        quaternion_wxyz: (4,) WXYZ unit quaternion.\n        z_approach: (float) Z-axis distance offset for goto_pose insertion approach motion. Will first arrive at position + z_approach meters in Z-axis before moving to the requested pose. Useful for more precise grasp approaches. Default is 0.0.\n    Returns:\n        None\n\nopen_gripper() -> None\n  Doc:\n    Open gripper fully.\n    \n    Args:\n        None\n\nclose_gripper() -> None\n  Doc:\n    Close gripper fully.\n    \n    Args:\n        None\n\nhome_pose() -> None\n  Doc:\n    Move the robot to a safe home pose.\n    Args:\n        None\n    Returns:\n        None"
+    }
+  ],
+  "input": "/tmp/large_teacher_sample_32.jsonl"
+}
