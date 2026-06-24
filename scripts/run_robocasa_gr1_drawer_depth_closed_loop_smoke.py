@@ -134,6 +134,8 @@ VISUAL_GRASP = estimate_sam3_rgbd_grasp_pose(
     text_prompt={sam3_text_prompt!r},
     arm="right",
     approach_distance=0.10,
+    crop_roi_xyxy={sam3_crop_roi_expr},
+    debug_output_dir={sam3_debug_output_dir!r},
 )
 SKILL = {{
     "skill_type": "drawer_pull",
@@ -155,12 +157,20 @@ SKILL = {{
 ANCHOR_DIAGNOSTICS = {{
     "anchor_source": "sam3",
     "sam3_text_prompt": {sam3_text_prompt!r},
+    "sam3_crop_roi_xyxy": {sam3_crop_roi_expr},
+    "sam3_debug_output_dir": {sam3_debug_output_dir!r},
     "visual_grasp_method": VISUAL_GRASP.get("method"),
     "visual_grasp_source": VISUAL_GRASP.get("source"),
 }}
 """.format(
                 camera_name=args.depth_camera_name,
                 sam3_text_prompt=args.sam3_text_prompt,
+                sam3_crop_roi_expr=(
+                    "None"
+                    if not str(args.sam3_crop_roi_xyxy).strip()
+                    else "(" + ", ".join(str(float(v.strip())) for v in args.sam3_crop_roi_xyxy.split(",")) + ")"
+                ),
+                sam3_debug_output_dir=str(out_dir / "sam3_anchor_debug"),
                 hand_preset=args.hand_preset,
             )
         elif anchor_source == "rgbd_roi":
@@ -311,6 +321,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--depth-camera-name", default="robot0_frontview")
     parser.add_argument("--sam3-text-prompt", default="drawer handle")
+    parser.add_argument(
+        "--sam3-crop-roi-xyxy",
+        default="",
+        help="Optional normalized image ROI for cropped SAM3 inference, e.g. 0.55,0.45,0.95,0.85. Empty keeps full-frame SAM3.",
+    )
     parser.add_argument(
         "--rgbd-roi-xyxy",
         default="0.34,0.42,0.66,0.72",

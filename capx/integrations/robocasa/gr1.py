@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import pathlib
 from typing import Any
 
 import numpy as np
@@ -946,13 +948,22 @@ class GR1RobocasaControlApi(ApiBase):
         arm: str = "right",
         approach_distance: float = 0.10,
         max_masks: int = 5,
+        crop_roi_xyxy: tuple[float, float, float, float] | list[float] | None = None,
+        debug_output_dir: str | None = None,
     ) -> dict[str, Any]:
         """Estimate a grasp pose from rendered RGBD plus a SAM3 image mask.
 
         The only target-selection input is the text prompt against the rendered
         RGB image. This is the minimal de-privileged ablation for replacing the
         earlier privileged ``observe_scene(...include_geoms=True)`` handle pose.
+
+        ``crop_roi_xyxy`` is an optional normalized image ROI in the full-image
+        coordinate frame. When set, SAM3 sees only that crop, then masks are
+        mapped back to the original RGBD frame before depth/PCA estimation. This
+        keeps the agent's visual prior explicit and reproducible.
         """
+        from PIL import Image
+
         from capx.integrations.vision.sam3 import init_sam3
 
         rgbd = self.get_rgbd_observation(
@@ -962,13 +973,48 @@ class GR1RobocasaControlApi(ApiBase):
             include_arrays=True,
         )
         rgb = np.asarray(rgbd["rgb"], dtype=np.uint8)
+        h, w = rgb.shape[:2]
+        crop_meta: dict[str, Any] | None = None
+        segment_rgb = rgb
+        if crop_roi_xyxy is not None:
+            x1f, y1f, x2f, y2f = [float(v) for v in crop_roi_xyxy]
+            x1 = int(np.clip(round(x1f * w), 0, w - 1))
+            y1 = int(np.clip(round(y1f * h), 0, h - 1))
+            x2 = int(np.clip(round(x2f * w), x1 + 1, w))
+            y2 = int(np.clip(round(y2f * h), y1 + 1, h))
+            segment_rgb = rgb[y1:y2, x1:x2]
+            crop_meta = {
+                "roi_xyxy": [x1f, y1f, x2f, y2f],
+                "pixel_box_xyxy": [x1, y1, x2, y2],
+                "crop_shape": [int(y2 - y1), int(x2 - x1), int(rgb.shape[2])],
+            }
         segment = init_sam3()
-        results = segment(rgb, str(text_prompt))
+        results = segment(segment_rgb, str(text_prompt))
         if not results:
             raise RuntimeError(f"SAM3 returned no masks for prompt {text_prompt!r}")
+        debug_dir = pathlib.Path(debug_output_dir) if debug_output_dir else None
+        debug_candidates: list[dict[str, Any]] = []
+        if debug_dir is not None:
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            Image.fromarray(rgb, mode="RGB").save(debug_dir / "00_rgb_full.png")
+            if crop_meta is not None:
+                Image.fromarray(segment_rgb, mode="RGB").save(debug_dir / "01_rgb_crop.png")
         candidates: list[tuple[float, dict[str, Any], dict[str, Any]]] = []
         for idx, result in enumerate(results[: max(1, int(max_masks))]):
-            mask = np.asarray(result.get("mask"), dtype=bool)
+            mask_crop = np.asarray(result.get("mask"), dtype=bool)
+            mask = mask_crop
+            raw_box = [float(x) for x in result.get("box", [])]
+            box_original = raw_box
+            if crop_meta is not None:
+                x1, y1, x2, y2 = [int(v) for v in crop_meta["pixel_box_xyxy"]]
+                if mask_crop.shape != (y2 - y1, x2 - x1):
+                    raise ValueError(
+                        f"SAM3 crop mask shape {mask_crop.shape} does not match crop {(y2 - y1, x2 - x1)}"
+                    )
+                mask = np.zeros((h, w), dtype=bool)
+                mask[y1:y2, x1:x2] = mask_crop
+                if len(raw_box) == 4:
+                    box_original = [raw_box[0] + x1, raw_box[1] + y1, raw_box[2] + x1, raw_box[3] + y1]
             try:
                 estimate = self._estimate_masked_rgbd_grasp_pose(
                     rgbd=rgbd,
@@ -977,23 +1023,67 @@ class GR1RobocasaControlApi(ApiBase):
                     approach_distance=approach_distance,
                     method="sam3_rgbd_mask_pca_v0",
                     source={
-                        "type": "sam3_text_prompt",
+                        "type": "sam3_text_prompt_roi_crop" if crop_meta is not None else "sam3_text_prompt",
                         "text_prompt": str(text_prompt),
                         "result_index": int(idx),
                         "score": float(result.get("score", 0.0)),
-                        "box": [float(x) for x in result.get("box", [])],
+                        "box": box_original,
+                        "box_in_crop": raw_box if crop_meta is not None else None,
                         "label": str(result.get("label", text_prompt)),
+                        "crop": crop_meta,
+                        "debug_output_dir": str(debug_dir) if debug_dir is not None else None,
                     },
                 )
             except Exception:
                 continue
             score = float(result.get("score", 0.0))
             candidates.append((score, result, estimate))
+            if debug_dir is not None:
+                raw = (mask.astype(np.uint8) * 255)
+                Image.fromarray(raw, mode="L").save(debug_dir / f"02_mask_{idx:02d}_raw_full.png")
+                overlay = rgb.copy()
+                color = np.array([30, 144, 255], dtype=np.uint8)
+                overlay[mask] = (overlay[mask].astype(np.float32) * 0.45 + color.astype(np.float32) * 0.55).astype(np.uint8)
+                Image.fromarray(overlay, mode="RGB").save(debug_dir / f"03_mask_{idx:02d}_overlay_full.png")
+                if crop_meta is not None:
+                    crop_raw = (mask_crop.astype(np.uint8) * 255)
+                    Image.fromarray(crop_raw, mode="L").save(debug_dir / f"04_mask_{idx:02d}_raw_crop.png")
+                    crop_overlay = segment_rgb.copy()
+                    crop_overlay[mask_crop] = (
+                        crop_overlay[mask_crop].astype(np.float32) * 0.45
+                        + color.astype(np.float32) * 0.55
+                    ).astype(np.uint8)
+                    Image.fromarray(crop_overlay, mode="RGB").save(debug_dir / f"05_mask_{idx:02d}_overlay_crop.png")
+                debug_candidates.append(
+                    {
+                        "index": int(idx),
+                        "score": score,
+                        "box": box_original,
+                        "box_in_crop": raw_box if crop_meta is not None else None,
+                        "mask_pixels": int(np.count_nonzero(mask)),
+                        "valid_depth_point_count": int(estimate.get("valid_depth_point_count", 0)),
+                    }
+                )
         if not candidates:
             raise RuntimeError(f"SAM3 masks for prompt {text_prompt!r} had no valid depth points")
         candidates.sort(key=lambda item: item[0], reverse=True)
         best = candidates[0][2]
         best["candidate_count"] = int(len(candidates))
+        if debug_dir is not None:
+            (debug_dir / "summary.json").write_text(
+                json.dumps(
+                    {
+                        "camera_name": rgbd["camera_name"],
+                        "text_prompt": str(text_prompt),
+                        "crop": crop_meta,
+                        "candidate_count": int(len(candidates)),
+                        "selected_source": best.get("source", {}),
+                        "candidates": debug_candidates,
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
         return best
 
     def probe_eef_directions(
@@ -1166,32 +1256,97 @@ class GR1RobocasaControlApi(ApiBase):
         """
         skill_type = str(skill.get("skill_type", "")).lower().strip()
         if skill_type == "pnp_pouring":
+            visual_anchors = skill.get("visual_anchors") if isinstance(skill.get("visual_anchors"), dict) else {}
+            source_anchor = visual_anchors.get("source_cup") if isinstance(visual_anchors.get("source_cup"), dict) else {}
+            target_anchor = (
+                visual_anchors.get("target_container")
+                if isinstance(visual_anchors.get("target_container"), dict)
+                else {}
+            )
+            source_cup_grasp_pos = skill.get("source_cup_grasp_pos", source_anchor.get("grasp_pos"))
+            target_container_pos = skill.get(
+                "target_container_pos",
+                target_anchor.get("grasp_pos", target_anchor.get("centroid")),
+            )
             return self.solve_pnp_pouring_cup_physical(
                 cup_name=str(skill.get("object_name", "obj_container")),
                 ball_name=str(skill.get("ball_name", "ball_obj")),
                 target_name=str(skill.get("target_name", "container")),
                 arm=str(skill.get("arm", "right")),
                 preset=str(skill.get("hand_pose_family", "cylindrical")),
-                approach_steps=18 if smoke else 30,
-                close_steps=16 if smoke else 22,
-                lift_steps=12 if smoke else 18,
-                move_steps=32 if smoke else 95,
-                pour_steps=12 if smoke else 30,
-                final_pour_joint_steps=14 if smoke else 55,
+                approach_steps=int(skill.get("approach_steps", 18 if smoke else 30)),
+                close_steps=int(skill.get("close_steps", 16 if smoke else 22)),
+                lift_steps=int(skill.get("lift_steps", 12 if smoke else 18)),
+                move_steps=int(skill.get("move_steps", 32 if smoke else 95)),
+                pour_steps=int(skill.get("pour_steps", 12 if smoke else 30)),
+                release_steps=int(skill.get("release_steps", 0)),
+                scale=float(skill.get("scale", 0.055)),
+                cup_grasp_z_offset=float(skill.get("cup_grasp_z_offset", -0.045)),
+                target_z_offset=float(skill.get("target_z_offset", 0.47)),
+                target_xy_offset=skill.get("target_xy_offset", (0.08, 0.0)),
+                pour_axis_angle_delta=skill.get("pour_axis_angle_delta", (0.0, 0.0, 0.0)),
+                use_geometry_pour=bool(skill.get("use_geometry_pour", False)),
+                pour_down_bias=float(skill.get("pour_down_bias", 0.35)),
+                pour_orientation_gain=float(skill.get("pour_orientation_gain", 1.0)),
+                use_pivot_pour=bool(skill.get("use_pivot_pour", True)),
+                pivot_forward=float(skill.get("pivot_forward", 0.06)),
+                pivot_drop=float(skill.get("pivot_drop", 0.08)),
+                pivot_lift=float(skill.get("pivot_lift", 0.33)),
+                use_object_pose_place=bool(skill.get("use_object_pose_place", True)),
+                object_place_axis_angle_delta=skill.get("object_place_axis_angle_delta", (0.0, 0.40, 0.0)),
+                cup_grasp_profile=str(skill.get("cup_grasp_profile", "cylindrical_lower")),
+                cup_grasp_side_offset=float(skill.get("cup_grasp_side_offset", 0.035)),
+                cup_grasp_z_floor=float(skill.get("cup_grasp_z_floor", -0.075)),
+                final_pour_axis_angle_delta=skill.get("final_pour_axis_angle_delta", (0.0, 0.0, 0.0)),
+                final_pour_steps=int(skill.get("final_pour_steps", 0)),
+                final_pour_joint_deltas=skill.get("final_pour_joint_deltas"),
+                final_pour_joint_steps=int(skill.get("final_pour_joint_steps", 14 if smoke else 55)),
+                source_cup_grasp_pos=source_cup_grasp_pos,
+                target_container_pos=target_container_pos,
+                use_transport_distance_feedback=bool(skill.get("use_transport_distance_feedback", True)),
+                use_final_pour_kinematic_policy=bool(skill.get("use_final_pour_kinematic_policy", False)),
+                final_pour_kinematic_steps=int(skill.get("final_pour_kinematic_steps", 14 if smoke else 55)),
+                final_pour_kinematic_source_axis=skill.get("final_pour_kinematic_source_axis", (0.0, -1.0, 0.0)),
+                final_pour_kinematic_down_bias=float(skill.get("final_pour_kinematic_down_bias", 0.35)),
+                final_pour_kinematic_orientation_gain=float(skill.get("final_pour_kinematic_orientation_gain", 0.85)),
+                final_pour_kinematic_max_axis_angle=float(skill.get("final_pour_kinematic_max_axis_angle", 0.22)),
+                final_pour_kinematic_target_z_offset=float(skill.get("final_pour_kinematic_target_z_offset", 0.24)),
+                visual_control_sources={
+                    "source_cup": {
+                        "present": bool(source_anchor),
+                        "method": source_anchor.get("method"),
+                        "source": source_anchor.get("source"),
+                        "camera_name": source_anchor.get("camera_name"),
+                    },
+                    "target_container": {
+                        "present": bool(target_anchor),
+                        "method": target_anchor.get("method"),
+                        "source": target_anchor.get("source"),
+                        "camera_name": target_anchor.get("camera_name"),
+                    },
+                },
             )
         if skill_type == "two_arm_lift":
             return self.lift_pot_by_handles(
                 preset=str(skill.get("hand_pose_family", "hook")),
                 plan=skill.get("plan") if isinstance(skill.get("plan"), dict) else None,
-                approach_steps=12 if smoke else 30,
-                grasp_steps=12 if smoke else 30,
-                close_steps=10 if smoke else 24,
-                lift_steps=16 if smoke else 55,
-                scale=0.035 if smoke else 0.04,
+                approach_steps=int(skill.get("approach_steps", 12 if smoke else 30)),
+                grasp_steps=int(skill.get("grasp_steps", 12 if smoke else 30)),
+                close_steps=int(skill.get("close_steps", 10 if smoke else 24)),
+                lift_steps=int(skill.get("lift_steps", 16 if smoke else 55)),
+                scale=float(skill.get("scale", 0.035 if smoke else 0.04)),
+                wrist_axis_angle_delta=skill.get("wrist_axis_angle_delta"),
             )
         if skill_type == "drawer_pull":
             arm = str(skill.get("arm", "right"))
             preset = str(skill.get("hand_pose_family", "hook"))
+            pregrasp_steps = int(skill.get("pregrasp_steps", 10 if smoke else 24))
+            approach_steps = int(skill.get("approach_steps", 10 if smoke else 24))
+            close_steps = int(skill.get("close_steps", 8 if smoke else 18))
+            pull_steps = int(skill.get("pull_steps", 10 if smoke else 40))
+            pregrasp_scale = float(skill.get("pregrasp_scale", 0.045))
+            approach_scale = float(skill.get("approach_scale", 0.035))
+            pull_scale = float(skill.get("pull_scale", 0.025 if smoke else 0.045))
             handle_pos = np.asarray(skill.get("handle_pos", self._eef_world_pos(arm)), dtype=np.float64).reshape(3)
             visual_grasp = skill.get("visual_grasp") if isinstance(skill.get("visual_grasp"), dict) else None
             pregrasp_pos = None
@@ -1229,8 +1384,8 @@ class GR1RobocasaControlApi(ApiBase):
                 self.move_towards_position(
                     pregrasp_pos,
                     arm=arm,
-                    steps=10 if smoke else 24,
-                    scale=0.045,
+                    steps=pregrasp_steps,
+                    scale=pregrasp_scale,
                     wrist_axis_angle_delta=wrist_axis_angle_delta,
                     wrist_target_quat_xyzw=wrist_target_quat_xyzw,
                 )
@@ -1238,8 +1393,8 @@ class GR1RobocasaControlApi(ApiBase):
                 self.move_towards_position(
                     handle_pos + np.array([0.0, 0.0, 0.06]),
                     arm=arm,
-                    steps=8 if smoke else 18,
-                    scale=0.045,
+                    steps=pregrasp_steps,
+                    scale=pregrasp_scale,
                     wrist_axis_angle_delta=wrist_axis_angle_delta,
                     wrist_target_quat_xyzw=wrist_target_quat_xyzw,
                 )
@@ -1247,8 +1402,8 @@ class GR1RobocasaControlApi(ApiBase):
             approach_summary = self.move_towards_position(
                 contact_target,
                 arm=arm,
-                steps=10 if smoke else 24,
-                scale=0.035,
+                steps=approach_steps,
+                scale=approach_scale,
                 wrist_axis_angle_delta=wrist_axis_angle_delta,
                 wrist_target_quat_xyzw=wrist_target_quat_xyzw,
             )
@@ -1257,7 +1412,7 @@ class GR1RobocasaControlApi(ApiBase):
             close_summary = self._set_hand_while_holding(
                 arm=arm,
                 preset=preset,
-                steps=8 if smoke else 18,
+                steps=close_steps,
                 wrist_axis_angle_delta=wrist_axis_angle_delta,
                 wrist_target_quat_xyzw=wrist_target_quat_xyzw,
             )
@@ -1266,8 +1421,8 @@ class GR1RobocasaControlApi(ApiBase):
             pull_summary = self.step_delta_action(
                 arm=arm,
                 delta_xyz=pull_axis,
-                steps=10 if smoke else 40,
-                scale=0.025 if smoke else 0.045,
+                steps=pull_steps,
+                scale=pull_scale,
                 hand_preset=preset,
                 wrist_axis_angle_delta=wrist_axis_angle_delta,
                 wrist_target_quat_xyzw=wrist_target_quat_xyzw,
@@ -1285,6 +1440,15 @@ class GR1RobocasaControlApi(ApiBase):
                 "wrist_axis_angle_delta": wrist_axis_angle_delta,
                 "wrist_target_quat_xyzw": wrist_target_quat_xyzw,
                 "wrist_orientation_frame": str(skill.get("wrist_orientation_frame", "world")),
+                "drawer_execution_params": {
+                    "pregrasp_steps": pregrasp_steps,
+                    "approach_steps": approach_steps,
+                    "close_steps": close_steps,
+                    "pull_steps": pull_steps,
+                    "pregrasp_scale": pregrasp_scale,
+                    "approach_scale": approach_scale,
+                    "pull_scale": pull_scale,
+                },
                 "handle_before": handle_before,
                 "handle_after": handle_after,
                 "handle_delta": None
@@ -1681,6 +1845,7 @@ class GR1RobocasaControlApi(ApiBase):
         approach_height: float = 0.10,
         grasp_height_offset: float = 0.025,
         grasp_position_offset: tuple[float, float, float] | list[float] | np.ndarray | None = None,
+        grasp_world_pos: tuple[float, float, float] | list[float] | np.ndarray | None = None,
     ) -> dict[str, Any]:
         """Run a geometric Fourier-hand grasp primitive.
 
@@ -1695,6 +1860,7 @@ class GR1RobocasaControlApi(ApiBase):
             approach_height=approach_height,
             grasp_height_offset=grasp_height_offset,
             grasp_position_offset=grasp_position_offset,
+            grasp_world_pos=grasp_world_pos,
         )
         selected = str(plan["arm"])
         preset_name = str(plan["preset"])
@@ -1818,6 +1984,7 @@ class GR1RobocasaControlApi(ApiBase):
         close_steps: int = 24,
         lift_steps: int = 55,
         scale: float = 0.04,
+        wrist_axis_angle_delta: np.ndarray | list[float] | tuple[float, float, float] | None = None,
     ) -> dict[str, Any]:
         """Attempt a physical TwoArmLift grasp by targeting both pot handles.
 
@@ -1831,25 +1998,67 @@ class GR1RobocasaControlApi(ApiBase):
             z_offset=z_offset,
             preset=preset,
         )
+        wrist_delta = None
+        if wrist_axis_angle_delta is not None:
+            wrist_delta = np.asarray(wrist_axis_angle_delta, dtype=np.float64).reshape(-1)
+            if wrist_delta.size < 3:
+                wrist_delta = np.pad(wrist_delta, (0, 3 - wrist_delta.size), mode="constant")
+            wrist_delta = np.clip(wrist_delta[:3], -0.9, 0.9)
+
+        def _contact_snapshot() -> dict[str, Any]:
+            left_eef = self._eef_world_pos("left")
+            right_eef = self._eef_world_pos("right")
+            left_handle = self._geom_world_pos(str(plan["left_handle_name"]))
+            right_handle = self._geom_world_pos(str(plan["right_handle_name"]))
+            return {
+                "left_eef_pos": left_eef,
+                "right_eef_pos": right_eef,
+                "left_handle_pos": left_handle,
+                "right_handle_pos": right_handle,
+                "left_eef_to_handle": float(np.linalg.norm(left_eef - left_handle)),
+                "right_eef_to_handle": float(np.linalg.norm(right_eef - right_handle)),
+            }
+
+        snapshots: dict[str, Any] = {"start": _contact_snapshot()}
         self.open_hand(arm="both", steps=4)
         self._move_bimanual_towards(
             plan["left_pregrasp_pos"],
             plan["right_pregrasp_pos"],
             steps=approach_steps,
             scale=max(float(scale), 0.045),
+            wrist_axis_angle_delta=wrist_delta,
         )
+        snapshots["after_pregrasp"] = _contact_snapshot()
         self._move_bimanual_towards(
             plan["left_grasp_pos"],
             plan["right_grasp_pos"],
             steps=grasp_steps,
             scale=float(scale),
+            wrist_axis_angle_delta=wrist_delta,
         )
-        close_summary = self.close_hand(arm="both", preset=preset, steps=close_steps)
-        lift_summary = self.step_delta_action(arm="both", delta_xyz=[0.0, 0.0, 1.0], steps=lift_steps, scale=float(scale))
+        snapshots["after_grasp_move"] = _contact_snapshot()
+        close_summary = self._set_hand_while_holding(
+            arm="both",
+            preset=preset,
+            steps=close_steps,
+            wrist_axis_angle_delta=wrist_delta,
+        )
+        snapshots["after_close"] = _contact_snapshot()
+        lift_summary = self.step_delta_action(
+            arm="both",
+            delta_xyz=[0.0, 0.0, 1.0],
+            steps=lift_steps,
+            scale=float(scale),
+            hand_preset=preset,
+            wrist_axis_angle_delta=wrist_delta,
+        )
+        snapshots["after_lift"] = _contact_snapshot()
         pot_after = self._body_world_pos("pot_root")
         final_state = self.get_task_state()
         return {
             "plan": plan,
+            "wrist_axis_angle_delta": wrist_delta if wrist_delta is not None else None,
+            "contact_snapshots": snapshots,
             "pot_before": pot_before,
             "pot_after": pot_after,
             "pot_delta": pot_after - pot_before,
@@ -1868,6 +2077,7 @@ class GR1RobocasaControlApi(ApiBase):
         approach_height: float = 0.10,
         grasp_height_offset: float = 0.025,
         grasp_position_offset: tuple[float, float, float] | list[float] | np.ndarray | None = None,
+        grasp_world_pos: tuple[float, float, float] | list[float] | np.ndarray | None = None,
     ) -> dict[str, Any]:
         """Plan a simple world-frame Fourier hand grasp around an object pose.
 
@@ -1875,10 +2085,22 @@ class GR1RobocasaControlApi(ApiBase):
         without looking inside the simulator.
         """
         object_key = self._canonical_object_name(object_name)
-        object_pos, object_quat = self.get_object_pose(object_key)
-        selected = self._nearest_arm(object_key) if str(arm).lower().strip() in {"auto", "nearest", "both"} else str(arm).lower().strip()
+        object_pos_true, object_quat = self.get_object_pose(object_key)
+        object_pos_source = "sim_object_pose"
+        if grasp_world_pos is None:
+            object_pos = np.asarray(object_pos_true, dtype=np.float64).reshape(3)
+        else:
+            object_pos = np.asarray(grasp_world_pos, dtype=np.float64).reshape(3)
+            object_pos_source = "visual_anchor_override"
+        arm_mode = str(arm).lower().strip()
+        if arm_mode in {"auto", "nearest", "both"}:
+            left_distance = float(np.linalg.norm(object_pos - self._eef_world_pos("left")))
+            right_distance = float(np.linalg.norm(object_pos - self._eef_world_pos("right")))
+            selected = "left" if left_distance <= right_distance else "right"
+        else:
+            selected = arm_mode
         preset_name = self._choose_grasp_preset(object_key, preset)
-        grasp_pos = np.asarray(object_pos, dtype=np.float64).reshape(3).copy()
+        grasp_pos = object_pos.copy()
         grasp_pos[2] += float(grasp_height_offset)
         position_offset = np.zeros(3, dtype=np.float64)
         if grasp_position_offset is not None:
@@ -1896,6 +2118,8 @@ class GR1RobocasaControlApi(ApiBase):
             "arm": selected,
             "preset": preset_name,
             "object_pos": object_pos,
+            "object_pos_true": np.asarray(object_pos_true, dtype=np.float64).reshape(3).copy(),
+            "object_pos_source": object_pos_source,
             "object_quat": object_quat,
             "pregrasp_pos": pregrasp_pos,
             "grasp_pos": grasp_pos,
@@ -2112,6 +2336,8 @@ class GR1RobocasaControlApi(ApiBase):
         patience: int = 6,
         min_improvement: float = 0.003,
         target_offset: tuple[float, float, float] | np.ndarray | None = None,
+        target_pos_override: tuple[float, float, float] | list[float] | np.ndarray | None = None,
+        use_distance_feedback: bool = True,
         restore_best_state: bool = True,
     ) -> dict[str, Any]:
         """Conservatively move a held object and restore the best distance state.
@@ -2126,8 +2352,14 @@ class GR1RobocasaControlApi(ApiBase):
         target_key = self._canonical_object_name(target_name)
         selected = "right" if str(arm).lower().strip() in {"auto", "nearest", "both"} else str(arm).lower().strip()
         can_restore = hasattr(self._env, "capture_state") and hasattr(self._env, "restore_state")
-        target_pos, _ = self.get_object_pose(target_key)
-        target_pos = np.asarray(target_pos, dtype=np.float64).reshape(3)
+        target_pos_true, _ = self.get_object_pose(target_key)
+        target_pos_true = np.asarray(target_pos_true, dtype=np.float64).reshape(3)
+        target_pos_source = "sim_object_pose"
+        if target_pos_override is None:
+            target_pos = target_pos_true.copy()
+        else:
+            target_pos = np.asarray(target_pos_override, dtype=np.float64).reshape(3)
+            target_pos_source = "visual_anchor_override"
         offset = np.zeros(3, dtype=np.float64) if target_offset is None else np.asarray(target_offset, dtype=np.float64).reshape(3)
         command_target_pos = target_pos + offset
 
@@ -2135,8 +2367,9 @@ class GR1RobocasaControlApi(ApiBase):
             object_pos, _ = self.get_object_pose(object_key)
             return float(np.linalg.norm(np.asarray(object_pos, dtype=np.float64).reshape(3) - target_pos))
 
-        best_distance = distance()
-        best_state = self._env.capture_state() if can_restore else None
+        distance_feedback_enabled = bool(use_distance_feedback)
+        best_distance = distance() if distance_feedback_enabled else None
+        best_state = self._env.capture_state() if can_restore and distance_feedback_enabled else None
         best_summary: dict[str, Any] | None = None
         stale_steps = 0
         summary: dict[str, Any] | None = None
@@ -2149,19 +2382,21 @@ class GR1RobocasaControlApi(ApiBase):
             self._set_arm_absolute_target(action, selected, step_target)
             self._set_hand_action(action, selected, holding_preset, 1.0)
             summary = self._repeat_action(action, steps=1)
-            current_distance = distance()
-            if current_distance + float(min_improvement) < best_distance:
-                best_distance = current_distance
-                best_summary = dict(summary)
-                best_state = self._env.capture_state() if can_restore else None
-                stale_steps = 0
-            else:
-                stale_steps += 1
+            if distance_feedback_enabled:
+                current_distance = distance()
+                assert best_distance is not None
+                if current_distance + float(min_improvement) < best_distance:
+                    best_distance = current_distance
+                    best_summary = dict(summary)
+                    best_state = self._env.capture_state() if can_restore else None
+                    stale_steps = 0
+                else:
+                    stale_steps += 1
             if summary["terminated"] or summary["truncated"] or summary["task_completed"]:
                 break
-            if stale_steps >= max(1, int(patience)):
+            if distance_feedback_enabled and stale_steps >= max(1, int(patience)):
                 break
-        if bool(restore_best_state) and can_restore and best_state is not None:
+        if bool(restore_best_state) and distance_feedback_enabled and can_restore and best_state is not None:
             self._env.restore_state(best_state)
             summary = best_summary if best_summary is not None else self.hold_still(steps=1)
         elif summary is None:
@@ -2170,7 +2405,11 @@ class GR1RobocasaControlApi(ApiBase):
         summary["target"] = target_key
         summary["arm"] = selected
         summary["target_offset"] = tuple(float(x) for x in offset)
-        summary["best_distance_to_target"] = float(best_distance)
+        summary["target_pos_source"] = target_pos_source
+        summary["target_pos_control"] = target_pos.copy()
+        summary["target_pos_true"] = target_pos_true.copy()
+        summary["distance_feedback_enabled"] = distance_feedback_enabled
+        summary["best_distance_to_target"] = None if best_distance is None else float(best_distance)
         summary["restore_best_state"] = bool(restore_best_state)
         summary["object_hand_alignment"] = self.measure_object_hand_alignment(object_key, selected)
         return summary
@@ -2459,6 +2698,17 @@ class GR1RobocasaControlApi(ApiBase):
         final_pour_steps: int = 0,
         final_pour_joint_deltas: dict[str, float] | None = None,
         final_pour_joint_steps: int = 55,
+        source_cup_grasp_pos: tuple[float, float, float] | list[float] | np.ndarray | None = None,
+        target_container_pos: tuple[float, float, float] | list[float] | np.ndarray | None = None,
+        visual_control_sources: dict[str, Any] | None = None,
+        use_transport_distance_feedback: bool = True,
+        use_final_pour_kinematic_policy: bool = False,
+        final_pour_kinematic_steps: int = 55,
+        final_pour_kinematic_source_axis: tuple[float, float, float] | list[float] = (0.0, -1.0, 0.0),
+        final_pour_kinematic_down_bias: float = 0.35,
+        final_pour_kinematic_orientation_gain: float = 0.85,
+        final_pour_kinematic_max_axis_angle: float = 0.22,
+        final_pour_kinematic_target_z_offset: float = 0.24,
     ) -> dict[str, Any]:
         """PnPPouring primitive that manipulates the source cup, not the ball.
 
@@ -2480,10 +2730,23 @@ class GR1RobocasaControlApi(ApiBase):
                 "robot0_r_wrist_roll": 1.50,
                 "robot0_r_shoulder_yaw": 0.25,
             }
-        cup_before, _ = self.get_object_pose(cup_key)
+        cup_before_true, _ = self.get_object_pose(cup_key)
         ball_before, _ = self.get_object_pose(ball_key)
-        target_pos, _ = self.get_object_pose(target_key)
-        target_pos = np.asarray(target_pos, dtype=np.float64).reshape(3)
+        target_pos_true, _ = self.get_object_pose(target_key)
+        cup_before_true = np.asarray(cup_before_true, dtype=np.float64).reshape(3)
+        target_pos_true = np.asarray(target_pos_true, dtype=np.float64).reshape(3)
+        source_pos_source = "sim_object_pose"
+        if source_cup_grasp_pos is None:
+            cup_control_pos = cup_before_true.copy()
+        else:
+            cup_control_pos = np.asarray(source_cup_grasp_pos, dtype=np.float64).reshape(3)
+            source_pos_source = "visual_anchor_override"
+        target_pos_source = "sim_object_pose"
+        if target_container_pos is None:
+            target_pos = target_pos_true.copy()
+        else:
+            target_pos = np.asarray(target_container_pos, dtype=np.float64).reshape(3)
+            target_pos_source = "visual_anchor_override"
         xy_offset = np.asarray(target_xy_offset, dtype=np.float64).reshape(-1)
         if xy_offset.size < 2:
             xy_offset = np.zeros(2, dtype=np.float64)
@@ -2500,6 +2763,12 @@ class GR1RobocasaControlApi(ApiBase):
         if final_pour_delta.size < 3:
             final_pour_delta = np.pad(final_pour_delta, (0, 3 - final_pour_delta.size), mode="constant")
         final_pour_delta = final_pour_delta[:3]
+        final_kin_source_axis = np.asarray(final_pour_kinematic_source_axis, dtype=np.float64).reshape(-1)
+        if final_kin_source_axis.size < 3:
+            final_kin_source_axis = np.pad(final_kin_source_axis, (0, 3 - final_kin_source_axis.size), mode="constant")
+        final_kin_source_axis = self._normalized(final_kin_source_axis[:3])
+        if float(np.linalg.norm(final_kin_source_axis)) < 1e-9:
+            final_kin_source_axis = np.array([0.0, -1.0, 0.0], dtype=np.float64)
         requested_params = {
             "approach_steps": int(approach_steps),
             "close_steps": int(close_steps),
@@ -2528,6 +2797,17 @@ class GR1RobocasaControlApi(ApiBase):
             "final_pour_steps": int(final_pour_steps),
             "final_pour_joint_deltas": {str(k): float(v) for k, v in (final_pour_joint_deltas or {}).items()},
             "final_pour_joint_steps": int(final_pour_joint_steps),
+            "source_cup_grasp_pos": None if source_cup_grasp_pos is None else cup_control_pos.copy(),
+            "target_container_pos": None if target_container_pos is None else target_pos.copy(),
+            "visual_control_sources": visual_control_sources or {},
+            "use_transport_distance_feedback": bool(use_transport_distance_feedback),
+            "use_final_pour_kinematic_policy": bool(use_final_pour_kinematic_policy),
+            "final_pour_kinematic_steps": int(final_pour_kinematic_steps),
+            "final_pour_kinematic_source_axis": tuple(float(x) for x in final_kin_source_axis),
+            "final_pour_kinematic_down_bias": float(final_pour_kinematic_down_bias),
+            "final_pour_kinematic_orientation_gain": float(final_pour_kinematic_orientation_gain),
+            "final_pour_kinematic_max_axis_angle": float(final_pour_kinematic_max_axis_angle),
+            "final_pour_kinematic_target_z_offset": float(final_pour_kinematic_target_z_offset),
         }
         requested_joint_deltas = {
             str(k): float(v)
@@ -2569,6 +2849,19 @@ class GR1RobocasaControlApi(ApiBase):
             "final_pour_joint_steps": max(0, int(final_pour_joint_steps)),
             "cup_lift_threshold": 0.025,
             "cup_target_collision_distance": 0.11,
+            "source_cup_grasp_pos_control": cup_control_pos.copy(),
+            "source_cup_grasp_pos_source": source_pos_source,
+            "target_container_pos_control": target_pos.copy(),
+            "target_container_pos_source": target_pos_source,
+            "target_container_pos_true": target_pos_true.copy(),
+            "use_transport_distance_feedback": bool(use_transport_distance_feedback),
+            "use_final_pour_kinematic_policy": bool(use_final_pour_kinematic_policy),
+            "final_pour_kinematic_steps": max(0, int(final_pour_kinematic_steps)),
+            "final_pour_kinematic_source_axis": tuple(float(x) for x in final_kin_source_axis),
+            "final_pour_kinematic_down_bias": float(np.clip(float(final_pour_kinematic_down_bias), 0.0, 1.2)),
+            "final_pour_kinematic_orientation_gain": float(np.clip(float(final_pour_kinematic_orientation_gain), 0.0, 2.0)),
+            "final_pour_kinematic_max_axis_angle": float(np.clip(float(final_pour_kinematic_max_axis_angle), 0.02, 0.8)),
+            "final_pour_kinematic_target_z_offset": float(np.clip(float(final_pour_kinematic_target_z_offset), 0.02, 0.45)),
         }
         grasp_position_offset = np.zeros(3, dtype=np.float64)
         profile_grasp_z_offset = float(effective_params["cup_grasp_z_offset"])
@@ -2576,7 +2869,7 @@ class GR1RobocasaControlApi(ApiBase):
             # Approximate a human cylindrical cup grasp: approach the lower cup
             # wall from the hand-facing side instead of aiming at the cup center.
             profile_grasp_z_offset = min(profile_grasp_z_offset, float(effective_params["cup_grasp_z_floor"]))
-            side_dir = np.asarray(self._eef_world_pos(selected), dtype=np.float64).reshape(3) - np.asarray(cup_before, dtype=np.float64).reshape(3)
+            side_dir = np.asarray(self._eef_world_pos(selected), dtype=np.float64).reshape(3) - cup_control_pos
             side_dir[2] = 0.0
             side_dir = self._normalized(side_dir)
             if float(np.linalg.norm(side_dir)) < 1e-9:
@@ -2595,12 +2888,13 @@ class GR1RobocasaControlApi(ApiBase):
             approach_height=0.10,
             grasp_height_offset=profile_grasp_z_offset,
             grasp_position_offset=grasp_position_offset,
+            grasp_world_pos=cup_control_pos,
         )
         selected = str(grasp_summary.get("arm", selected))
         cup_after_grasp, cup_quat_after_grasp = self.get_object_pose(cup_key)
         ball_after_grasp, _ = self.get_object_pose(ball_key)
-        cup_lifted = float(np.asarray(cup_after_grasp, dtype=np.float64)[2] - np.asarray(cup_before, dtype=np.float64)[2])
-        cup_moved = float(np.linalg.norm(np.asarray(cup_after_grasp, dtype=np.float64) - np.asarray(cup_before, dtype=np.float64)))
+        cup_lifted = float(np.asarray(cup_after_grasp, dtype=np.float64)[2] - cup_before_true[2])
+        cup_moved = float(np.linalg.norm(np.asarray(cup_after_grasp, dtype=np.float64) - cup_before_true))
         cup_alignment = self.measure_object_hand_alignment(cup_key, selected)
         cup_contact_established = (
             cup_lifted > float(effective_params["cup_lift_threshold"])
@@ -2611,6 +2905,7 @@ class GR1RobocasaControlApi(ApiBase):
         transport_summary: dict[str, Any] | None = None
         pour_summary: dict[str, Any] | None = None
         final_pour_summary: dict[str, Any] | None = None
+        final_kinematic_pour_summary: dict[str, Any] | None = None
         final_joint_posture_summary: dict[str, Any] | None = None
         release_summary: dict[str, Any] | None = None
         if cup_contact_established and not bool(grasp_summary.get("task_completed", False)):
@@ -2643,6 +2938,8 @@ class GR1RobocasaControlApi(ApiBase):
                 scale=float(effective_params["scale"]),
                 target_z_offset=float(effective_params["target_z_offset"]),
                 target_offset=target_offset,
+                target_pos_override=target_pos,
+                use_distance_feedback=bool(effective_params["use_transport_distance_feedback"]),
                 patience=10,
                 restore_best_state=False,
             )
@@ -2761,6 +3058,59 @@ class GR1RobocasaControlApi(ApiBase):
                     final_pour_summary["final_pour_axis_angle_delta"] = tuple(float(x) for x in final_delta)
                     final_pour_summary["final_pour_steps"] = int(effective_params["final_pour_steps"])
                     phase = "cup_final_rotation_attempted"
+            if bool(effective_params["use_final_pour_kinematic_policy"]) and int(effective_params["final_pour_kinematic_steps"]) > 0:
+                final_kinematic_orientation_deltas: list[dict[str, Any]] = []
+                final_kinematic_target = target_pos + target_offset
+                final_kinematic_target[2] += float(effective_params["final_pour_kinematic_target_z_offset"])
+                final_kin_source_axis = np.asarray(
+                    effective_params["final_pour_kinematic_source_axis"], dtype=np.float64
+                ).reshape(3)
+                for step_idx in range(int(effective_params["final_pour_kinematic_steps"])):
+                    current = self._eef_world_pos(selected)
+                    current_quat = self._eef_world_quat_xyzw(selected)
+                    current_axis_world = self._quat_xyzw_to_matrix(current_quat) @ final_kin_source_axis
+                    target_dir = target_pos - current
+                    target_dir[2] -= float(effective_params["final_pour_kinematic_down_bias"])
+                    target_dir = self._normalized(target_dir)
+                    if float(np.linalg.norm(target_dir)) < 1e-9:
+                        target_dir = np.array([0.0, 0.0, -1.0], dtype=np.float64)
+                    axis_delta = self._axis_angle_from_vectors(current_axis_world, target_dir)
+                    axis_delta = self._limit_axis_angle(
+                        axis_delta * float(effective_params["final_pour_kinematic_orientation_gain"]),
+                        max_norm=float(effective_params["final_pour_kinematic_max_axis_angle"]),
+                    )
+                    action = self._hold_pose_action()
+                    next_pos = current + self._clipped_step_delta(
+                        final_kinematic_target - current,
+                        max_step=float(effective_params["scale"]),
+                    )
+                    self._set_arm_absolute_target(action, selected, next_pos)
+                    self._add_arm_axis_angle_delta(action, selected, axis_delta)
+                    self._set_hand_action(action, selected, str(grasp_summary.get("preset", preset)), 1.0)
+                    final_kinematic_pour_summary = self._repeat_action(action, steps=1)
+                    if step_idx >= max(0, int(effective_params["final_pour_kinematic_steps"]) - 5):
+                        final_kinematic_orientation_deltas.append(
+                            {
+                                "step": step_idx,
+                                "current_axis_world": current_axis_world,
+                                "target_dir": target_dir,
+                                "axis_delta": axis_delta,
+                            }
+                        )
+                    if (
+                        final_kinematic_pour_summary["terminated"]
+                        or final_kinematic_pour_summary["truncated"]
+                        or final_kinematic_pour_summary["task_completed"]
+                    ):
+                        break
+                if final_kinematic_pour_summary is not None:
+                    final_kinematic_pour_summary["policy"] = "visual_target_wrist_kinematic_v0"
+                    final_kinematic_pour_summary["target_pos_control"] = target_pos.copy()
+                    final_kinematic_pour_summary["target_offset"] = target_offset.copy()
+                    final_kinematic_pour_summary["wrist_position_target"] = final_kinematic_target.copy()
+                    final_kinematic_pour_summary["source_axis_local"] = final_kin_source_axis.copy()
+                    final_kinematic_pour_summary["orientation_deltas_tail"] = final_kinematic_orientation_deltas
+                    phase = "cup_final_kinematic_policy_attempted"
             joint_deltas = dict(effective_params["final_pour_joint_deltas"])
             if int(effective_params["final_pour_joint_steps"]) > 0 and joint_deltas:
                 final_joint_posture_summary = {
@@ -2829,14 +3179,14 @@ class GR1RobocasaControlApi(ApiBase):
         final_state = self.get_task_state()
 
         def dist_to_target(pos: np.ndarray) -> float:
-            return float(np.linalg.norm(np.asarray(pos, dtype=np.float64).reshape(3) - target_pos))
+            return float(np.linalg.norm(np.asarray(pos, dtype=np.float64).reshape(3) - target_pos_true))
 
         def xy_dist_to_target(pos: np.ndarray) -> float:
-            delta = np.asarray(pos, dtype=np.float64).reshape(3) - target_pos
+            delta = np.asarray(pos, dtype=np.float64).reshape(3) - target_pos_true
             return float(np.linalg.norm(delta[:2]))
 
         def vertical_offset_to_target(pos: np.ndarray) -> float:
-            delta = np.asarray(pos, dtype=np.float64).reshape(3) - target_pos
+            delta = np.asarray(pos, dtype=np.float64).reshape(3) - target_pos_true
             return float(delta[2])
 
         cup_target_distance = dist_to_target(cup_after)
@@ -2854,9 +3204,18 @@ class GR1RobocasaControlApi(ApiBase):
             "preset": str(grasp_summary.get("preset", preset)),
             "requested_params": requested_params,
             "effective_params": effective_params,
-            "cup_before": cup_before,
+            "visual_control": {
+                "source_cup_grasp_pos_source": source_pos_source,
+                "source_cup_grasp_pos_control": cup_control_pos.copy(),
+                "source_cup_pos_true": cup_before_true.copy(),
+                "target_container_pos_source": target_pos_source,
+                "target_container_pos_control": target_pos.copy(),
+                "target_container_pos_true": target_pos_true.copy(),
+                "sources": visual_control_sources or {},
+            },
+            "cup_before": cup_before_true.copy(),
             "cup_after": cup_after,
-            "cup_delta": np.asarray(cup_after, dtype=np.float64) - np.asarray(cup_before, dtype=np.float64),
+            "cup_delta": np.asarray(cup_after, dtype=np.float64) - cup_before_true,
             "ball_before": ball_before,
             "ball_after": ball_after,
             "ball_delta": np.asarray(ball_after, dtype=np.float64) - np.asarray(ball_before, dtype=np.float64),
@@ -2879,6 +3238,7 @@ class GR1RobocasaControlApi(ApiBase):
             "transport_stage": transport_summary,
             "pour_stage": pour_summary,
             "final_pour_stage": final_pour_summary,
+            "final_kinematic_pour_stage": final_kinematic_pour_summary,
             "final_joint_posture_stage": final_joint_posture_summary,
             "release_stage": release_summary,
             "final_state": final_state,
@@ -3071,6 +3431,7 @@ class GR1RobocasaControlApi(ApiBase):
         *,
         steps: int,
         scale: float,
+        wrist_axis_angle_delta: np.ndarray | list[float] | tuple[float, float, float] | None = None,
     ) -> dict[str, Any]:
         summary: dict[str, Any] | None = None
         targets = {
@@ -3083,6 +3444,8 @@ class GR1RobocasaControlApi(ApiBase):
                 current = self._eef_world_pos(arm_name)
                 step_target = current + self._clipped_step_delta(target - current, max_step=float(scale))
                 self._set_arm_absolute_target(action, arm_name, step_target)
+                if wrist_axis_angle_delta is not None:
+                    self._add_arm_axis_angle_delta(action, arm_name, wrist_axis_angle_delta)
             summary = self._repeat_action(action, steps=1)
             if summary["terminated"] or summary["truncated"] or summary["task_completed"]:
                 break
