@@ -410,3 +410,24 @@ GRPO medium checkpoint compression:
 - Compression output path: `/inspire/hdd/global_user/huaizezheng-p-huaizezheng/rl-homework/models/grpo_lift_medium_4h100_global_step32_hf.tar.gz`.
 - Compression log: `/inspire/hdd/global_user/huaizezheng-p-huaizezheng/rl-homework/logs/compress_grpo_lift_medium_4h100_global_step32_hf.log`.
 - Compression status check on 2026-06-23: background process `750270` was still running; temporary archive `/inspire/hdd/global_user/huaizezheng-p-huaizezheng/rl-homework/models/grpo_lift_medium_4h100_global_step32_hf.tar.gz.tmp` had reached about `4.1G` after roughly `10` minutes. The final `.tar.gz` should appear only after `tar` finishes and the temporary file is moved atomically.
+
+Multi-task VeRL environment expansion: Franka restack smoke:
+- Purpose: move beyond the saturated single-task lift setting by adding a second Franka code environment for multi-task GRPO/RFT experiments.
+- Candidate environment: `franka_restack_code_env`.
+- Added generic local launchers:
+  - `rft/scripts/run_oracle_eval_local.sh`
+  - `rft/scripts/run_fair_eval_local.sh`
+- Oracle smoke command: `DATA_SOURCE=franka_restack_code_env NUM_TRIALS=3 SEED_BASE=62000 OUT_ROOT=/media/user/B29202FA9202C2B91/cap-x/rft/evals/local_oracle_franka_restack_3seeds_0624 bash rft/scripts/run_oracle_eval_local.sh`.
+- Oracle smoke result: strict success `3 / 3`, valid execution `3 / 3`, mean score `1.0`.
+- Base smoke command: `DATA_SOURCE=franka_restack_code_env MODEL_PATH=/media/user/B29202FA9202C2B91/rl-homework/models/Qwen2.5-Coder-7B-Instruct MODEL_LABEL=base_restack_local NUM_TRIALS=10 SEED_BASE=62000 GEN_BATCH_SIZE=1 OUT_ROOT=/media/user/B29202FA9202C2B91/cap-x/rft/evals/local_fair_franka_restack_base_10seeds_0624 bash rft/scripts/run_fair_eval_local.sh`.
+- Base smoke result: strict success `0 / 10`, valid execution `10 / 10`, mean score `0.09012812600343614`.
+- Observed base failure modes: empty completions, undefined variables such as `green_cube_extent`, wrong object-name variants such as `red_cube`, and incorrect placement target positions.
+- Interpretation: `franka_restack_code_env` is a good next environment. The oracle can complete it under the local strict evaluator, while the base model is far from saturated. This makes it more useful than lift for testing multi-task generalization and subsequent GRPO/RFT.
+
+Multi-source VeRL dataset builder smoke:
+- Added script: `rft/scripts/prepare_verl_multisource_dataset.py`.
+- Added training launcher: `rft/scripts/train_franka_grpo_multisource_global.sh`.
+- Smoke command: `PYTHONPATH=/media/user/B29202FA9202C2B91/cap-x /media/user/B29202FA9202C2B91/cap-x/.venv/bin/python /media/user/B29202FA9202C2B91/cap-x/rft/scripts/prepare_verl_multisource_dataset.py --output-dir /tmp/capx_multisource_smoke --data-sources franka_lift_code_env,franka_restack_code_env --train-size-per-source 2 --val-size-per-source 1 --seed 63000 --jsonl-only`.
+- Smoke result: train rows `4` total, with `2` from `franka_lift_code_env` and `2` from `franka_restack_code_env`; val rows `2` total, with `1` per environment.
+- Local note: the CaP-X `.venv` used for simulation does not include `pyarrow`, so the local smoke used `--jsonl-only`. The Inspire training environment should use parquet output for VeRL; `pyarrow` is still required there.
+- Interpretation: the mixed dataset format is compatible with VeRL's per-row `data_source` reward routing. The strict reward function already initializes environments by `data_source`, so multi-source GRPO should be feasible once the parquet dataset is built in the training environment.
